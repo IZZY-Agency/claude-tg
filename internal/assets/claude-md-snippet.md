@@ -1,0 +1,1 @@
+Telegram: when something is critical, when a monitoring result is due, or when the user asks to be notified or followed, use the `telegram-notify` skill (`tg` CLI). Never message Telegram any other way.

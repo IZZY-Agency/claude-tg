@@ -1,0 +1,1 @@
+{"session_id":"6449d606-55c1-4e6d-a915-4b14c777f57f","cwd":"/Users/alex/code/acme-shop","hook_event_name":"PermissionRequest","tool_name":"Edit","tool_input":{"file_path":"/Users/alex/code/acme-shop/config/settings.php","old_string":"a","new_string":"b"}}

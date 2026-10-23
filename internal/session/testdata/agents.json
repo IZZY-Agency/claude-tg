@@ -1,0 +1,119 @@
+[
+  {
+    "id": "125d522a",
+    "cwd": "/Users/alex/code/blog",
+    "kind": "background",
+    "startedAt": 1782201021374,
+    "sessionId": "125d522a-da5c-4a2f-b490-19d40c4b66c5",
+    "name": "url-revert",
+    "state": "blocked"
+  },
+  {
+    "pid": 10250,
+    "cwd": "/Users/alex/code/acme-shop",
+    "kind": "interactive",
+    "startedAt": 1792529350515,
+    "sessionId": "6449d606-55c1-4e6d-a915-4b14c777f57f",
+    "name": "acme-shop-92",
+    "status": "busy"
+  },
+  {
+    "pid": 80034,
+    "cwd": "/Users/alex/code/blog",
+    "kind": "interactive",
+    "startedAt": 1792565068704,
+    "sessionId": "6ab28867-ffed-4ce8-b5c1-567102830f69",
+    "name": "blog-e2",
+    "status": "idle"
+  },
+  {
+    "pid": 36393,
+    "cwd": "/Users/alex/code/infra",
+    "kind": "interactive",
+    "startedAt": 1792569990681,
+    "sessionId": "2ed39dc1-56ca-4876-86ce-b2cdcbba427b",
+    "name": "infra-fa",
+    "status": "idle"
+  },
+  {
+    "pid": 46321,
+    "cwd": "/Users/alex/code/acme-shop",
+    "kind": "interactive",
+    "startedAt": 1792573065120,
+    "sessionId": "09afe86f-f5fa-47e6-83f0-36d40b318ec4",
+    "name": "acme-shop-fa",
+    "status": "idle"
+  },
+  {
+    "pid": 64795,
+    "cwd": "/Users/alex/code/blog/themes/blog",
+    "kind": "interactive",
+    "startedAt": 1792574472634,
+    "sessionId": "7f8d9498-3089-4fe6-9e35-462e3019fa47",
+    "name": "blog-fb",
+    "status": "idle"
+  },
+  {
+    "pid": 47208,
+    "cwd": "/Users/alex/code/infra",
+    "kind": "interactive",
+    "startedAt": 1792583933030,
+    "sessionId": "a8f6b867-03f1-4efa-8371-68dbb4081a33",
+    "name": "infra-0a",
+    "status": "busy"
+  },
+  {
+    "pid": 2185,
+    "cwd": "/Users/alex/code/docs.example.com",
+    "kind": "interactive",
+    "startedAt": 1792648406130,
+    "sessionId": "165bd956-0ec0-4d3b-819e-6a6cda83893e",
+    "name": "docs-example-com-7b",
+    "status": "idle"
+  },
+  {
+    "pid": 20285,
+    "cwd": "/Users/alex/code/blog",
+    "kind": "interactive",
+    "startedAt": 1792650788233,
+    "sessionId": "a63990de-2c2d-473d-bb2a-1bdfd313136e",
+    "name": "blog-6a",
+    "status": "busy"
+  },
+  {
+    "pid": 40399,
+    "cwd": "/Users/alex/code/infra",
+    "kind": "interactive",
+    "startedAt": 1792655275819,
+    "sessionId": "3b0166a9-3ecc-4fa6-8277-38dce16062a3",
+    "name": "infra-75",
+    "status": "idle"
+  },
+  {
+    "pid": 45797,
+    "cwd": "/Users/alex/code/acme-shop",
+    "kind": "interactive",
+    "startedAt": 1792655571025,
+    "sessionId": "9e2f18aa-f98c-4650-816f-ad53ad1a84ab",
+    "name": "acme-shop-9f",
+    "status": "idle"
+  },
+  {
+    "pid": 34025,
+    "cwd": "/Users/alex/code/example.com",
+    "kind": "interactive",
+    "startedAt": 1792671862076,
+    "sessionId": "7eac299e-a256-4664-889a-61774586489b",
+    "name": "example-com-91",
+    "status": "idle"
+  },
+  {
+    "pid": 6553,
+    "cwd": "/Users/alex/code/blog",
+    "kind": "interactive",
+    "startedAt": 1792676029762,
+    "sessionId": "f235d0a8-3ceb-4e49-b25e-32ed0aadf7ca",
+    "name": "blog-ca",
+    "status": "idle"
+  }
+]
