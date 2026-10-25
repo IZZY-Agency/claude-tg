@@ -430,13 +430,16 @@ func setupCheck(c *cli, p paths, existing *config.Config, bin string) int {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		fmt.Fprintf(c.stdout, "settings: unreadable: %v\n", err)
 	}
-	installed, missing, missingRules, err := settings.Status(src, bin)
+	installed, missing, outdated, missingRules, err := settings.Status(src, bin)
 	if err != nil {
 		fmt.Fprintf(c.stdout, "settings: not valid JSON: %v\n", err)
 	} else {
-		fmt.Fprintf(c.stdout, "hooks: %d/%d installed in %s\n", len(installed), len(installed)+len(missing), p.settings)
+		fmt.Fprintf(c.stdout, "hooks: %d/%d installed in %s\n", len(installed), len(installed)+len(missing)+len(outdated), p.settings)
 		for _, m := range missing {
-			fmt.Fprintf(c.stdout, "  missing: %s %s\n", m.Event, m.Matcher)
+			fmt.Fprintf(c.stdout, "  missing: %s\n", hookLabel(m))
+		}
+		for _, m := range outdated {
+			fmt.Fprintf(c.stdout, "  outdated: %s (run `tg setup` to update it)\n", hookLabel(m))
 		}
 		fmt.Fprintf(c.stdout, "allow rules: %d/%d\n", len(settings.AllowRules)-len(missingRules), len(settings.AllowRules))
 	}
@@ -472,6 +475,14 @@ func setupCheck(c *cli, p paths, existing *config.Config, bin string) int {
 		}
 	}
 	return exitOK
+}
+
+// hookLabel names a hook as "Event" or "Event matcher".
+func hookLabel(h settings.HookSpec) string {
+	if h.Matcher == "" {
+		return h.Event
+	}
+	return h.Event + " " + h.Matcher
 }
 
 // fileMode returns the permission bits of path, or 0644 when it does not exist.

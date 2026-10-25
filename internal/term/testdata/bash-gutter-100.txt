@@ -1,0 +1,23 @@
+❯ Run exactly this single-line Bash command, verbatim, and do nothing else: touch                   
+  sigcheck-gutter-alpha.txt sigcheck-gutter-bravo.txt sigcheck-gutter-charlie.txt                   
+  sigcheck-gutter-delta-e.txt                                                                       
+
+⏺ Bash(touch sigcheck-gutter-alpha.txt sigcheck-gutter-bravo.txt sigcheck-gutter-charlie.txt
+      sigcheck-gutter-delta-e.txt)
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+ Create four empty files
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ touch sigcheck-gutter-alpha.txt sigcheck-gutter-bravo.txt sigcheck-gutter-charlie.txt
+ │ sigcheck-gutter-delta-e.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to /Users/alex/probe from this project
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend

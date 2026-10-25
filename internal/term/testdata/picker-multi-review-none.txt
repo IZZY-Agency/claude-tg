@@ -1,0 +1,15 @@
+❯ Use the AskUserQuestion tool right now, with exactly two questions in one call: 1) multi-select question "Which colours do you like for the probe?", header         
+  "Colours", options Red, Green, Blue (each with a one-word description); 2) single-choice question "Which pet suits the probe?", header "Pet", options Cat, Dog      
+  (each with a one-word description). Do nothing else.                                                                                                                
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Colours  ☐ Pet  ✔ Submit  →
+
+Review your answers
+
+⚠ You have not answered all questions
+
+Ready to submit your answers?
+
+❯ 1. Submit answers
+  2. Cancel

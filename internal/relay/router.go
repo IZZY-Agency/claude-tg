@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/IZZY-Agency/claude-tg/internal/render"
+	"github.com/IZZY-Agency/claude-tg/internal/send"
 	"github.com/IZZY-Agency/claude-tg/internal/session"
 	"github.com/IZZY-Agency/claude-tg/internal/state"
 	"github.com/IZZY-Agency/claude-tg/internal/telegram"
@@ -24,7 +25,8 @@ type API interface {
 	SendMessage(ctx context.Context, r telegram.SendRequest) (int64, error)
 	SetMessageReaction(ctx context.Context, chatID, messageID int64, emoji string) error
 	AnswerCallbackQuery(ctx context.Context, id, text string) error
-	EditMessageText(ctx context.Context, chatID, messageID int64, text, parseMode string) error
+	EditMessage(ctx context.Context, chatID, messageID int64, text, parseMode string, kb [][]telegram.Button) error
+	EditReplyMarkup(ctx context.Context, chatID, messageID int64, kb [][]telegram.Button) error
 }
 
 // Agents lists the live Claude Code sessions.
@@ -42,6 +44,10 @@ type Router struct {
 	Sleep     func(context.Context, time.Duration) // nil: real sleep; tests use a virtual clock
 	Log       func(string, ...any)
 	StartedAt time.Time
+	Alive     func(pid int) bool // is a waiting hook's process alive; nil: signal 0
+	Secrets   []string           // never shown in a message, a button or a toast (the bot token), as send.Sender.Secrets
+
+	afterApply func(askID string) // tests: runs between saving a tap's or reply's result and acting on it
 }
 
 // Live is a running session as the relay sees it.
@@ -56,7 +62,7 @@ type Live struct {
 
 const (
 	maxText     = 4000
-	screenLines = 40
+	screenLines = 60 // as the waiting hook reads its pane: a picker with previews is tall
 	pendingTTL  = 10 * time.Minute
 )
 
@@ -65,10 +71,10 @@ var Commands = []telegram.BotCommand{
 	{Command: "sessions", Description: "live sessions and follow state"},
 	{Command: "follow", Description: "follow a session: /follow name"},
 	{Command: "unfollow", Description: "stop following: /unfollow name"},
-	{Command: "approve", Description: "approve the permission prompt (reply or @name)"},
-	{Command: "deny", Description: "deny the permission prompt (reply or @name)"},
+	{Command: "approve", Description: "fallback: approve a permission prompt (reply to it or @name)"},
+	{Command: "deny", Description: "fallback: deny a permission prompt (reply to it or @name)"},
 	{Command: "status", Description: "relay status"},
-	{Command: "help", Description: "how to address a session"},
+	{Command: "help", Description: "how to address a session, answer prompts"},
 }
 
 func (r *Router) now() time.Time {
@@ -97,9 +103,20 @@ func (r *Router) allowed(from *telegram.User, chatID int64) bool {
 
 func bold(s string) string { return "<b>" + render.EscapeHTML(s) + "</b>" }
 
+// send posts html, the secrets scrubbed and redacted between its tags as
+// every text tg sends is (it may echo what the user typed, a pane's error
+// or a prompt's summary), and its buttons' texts cleaned alike (session
+// names).
 func (r *Router) send(ctx context.Context, replyTo int64, html string, kb [][]telegram.Button) (int64, error) {
-	return r.API.SendMessage(ctx, telegram.SendRequest{ChatID: r.ChatID, Text: html, ParseMode: "HTML", ReplyToMessageID: replyTo, InlineKeyboard: kb})
+	if kb != nil {
+		kb = r.cleanKeyboard(kb)
+	}
+	return r.API.SendMessage(ctx, telegram.SendRequest{ChatID: r.ChatID, Text: render.RedactHTML(r.scrub(html)), ParseMode: "HTML", ReplyToMessageID: replyTo, InlineKeyboard: kb})
 }
+
+// scrub masks the configured secrets (send.Scrub); the redaction of
+// credentials comes after it.
+func (r *Router) scrub(text string) string { return send.Scrub(text, r.Secrets) }
 
 func (r *Router) reply(ctx context.Context, m *telegram.Message, html string) error {
 	_, err := r.send(ctx, m.MessageID, html, nil)
@@ -147,6 +164,17 @@ func (r *Router) Handle(ctx context.Context, u telegram.Update) error {
 	text := strings.TrimSpace(m.Text)
 	if text == "" {
 		return nil
+	}
+	// A reply to a message of an open question or permission prompt answers
+	// it (one answered but not yet collected by its hook says so), even when
+	// it starts with "/" like a path; only /approve and /deny stay commands.
+	// A reply to a closed one is a prompt or command for its session as usual.
+	if m.ReplyToMessage != nil {
+		if cmd, _ := ParseCommand(text); cmd != "approve" && cmd != "deny" {
+			if a, i, ok := r.Store.FindAskByMessageID(m.ReplyToMessage.MessageID); ok && (a.Open() || a.Done && !r.hookGone(a)) {
+				return r.replyToAsk(ctx, m, a.ID, i, text)
+			}
+		}
 	}
 	if strings.HasPrefix(text, "/") {
 		return r.command(ctx, m, text)
@@ -288,9 +316,15 @@ func (r *Router) text(ctx context.Context, m *telegram.Message, text string) err
 // option). A dialog that appears meanwhile withholds Enter, since Enter in
 // a dialog confirms "Yes". A doubled or garbled input line, seen in the
 // field under load, is cleared with backspaces and retyped once.
+// Nothing is typed while the session waits on a question or permission
+// prompt a hook handles, sent here or not yet: the picker is open at the
+// Mac and the answer belongs on its message.
 // The returned error text is HTML for the user; note is a follow-up such as
 // "queued".
 func (r *Router) deliver(ctx context.Context, l *Live, text string) (string, error) {
+	if err := r.askRefusal(l); err != nil {
+		return "", err
+	}
 	line := term.OneLine(text)
 	if n := utf8.RuneCountInString(line); n > maxText {
 		return "", fmt.Errorf("too long: %d characters, the limit is %d", n, maxText)
@@ -305,8 +339,8 @@ func (r *Router) deliver(ctx context.Context, l *Live, text string) (string, err
 	if err != nil {
 		return "", fmt.Errorf("cannot read %s: %s", bold(l.Name), render.EscapeHTML(err.Error()))
 	}
-	if term.PromptVisible(screen) {
-		return "", fmt.Errorf("%s is waiting on a permission prompt; send /approve or /deny first", bold(l.Name))
+	if why := refusal(l.Name, screen); why != "" {
+		return "", errors.New(why)
 	}
 	owed := 1
 	if l.Busy {
@@ -325,7 +359,7 @@ func (r *Router) deliver(ctx context.Context, l *Live, text string) (string, err
 		}
 		got, ok, err := r.awaitInput(ctx, l.Pane, want)
 		if errors.Is(err, errDialog) {
-			return fail("a permission prompt appeared in %s while typing; your text was not submitted. Send /approve or /deny, then send the text again", bold(l.Name))
+			return fail("a permission prompt or question appeared in %s while typing; your text was not submitted. Answer it, then send the text again", bold(l.Name))
 		}
 		if err != nil {
 			return fail("cannot read %s while typing: %s", bold(l.Name), render.EscapeHTML(err.Error()))
@@ -359,6 +393,71 @@ const (
 
 var errDialog = errors.New("permission dialog appeared")
 
+// The dialogs text must never be typed into (Enter confirms their first
+// option, a digit picks an option), as dialogOn reports them.
+const (
+	dialogNone       = iota
+	dialogPermission // any tool's permission dialog; /approve and /deny answer it
+	dialogQuestion   // the AskUserQuestion picker
+	dialogPlan       // plan approval ("Ready to code?")
+	dialogPartial    // the picker's marks, but no picker the read holds whole
+)
+
+// dialogOn names the dialog at the bottom of screen (rulings R28, R32,
+// R38). The plan approval and the question picker come before the
+// permission classification: a plan line may read "Do you want to …" over
+// the plan's numbered options, and a picker may ask "Do you want to
+// proceed?" over its own. A read that shows the picker's marks
+// (term.PickerMarkers) and none of these is a picker read in part (its
+// review screen or footer cut): it is never typed into either.
+func dialogOn(screen string) int {
+	switch {
+	case term.PlanApproval(screen):
+		return dialogPlan
+	case term.PickerSignature(screen) != "":
+		return dialogQuestion
+	case permissionSignature(screen) != "":
+		return dialogPermission
+	case term.PickerMarkers(screen):
+		return dialogPartial
+	}
+	return dialogNone
+}
+
+// permissionSignature identifies the permission dialog at the bottom of
+// screen, of any tool (ruling R32); "" when there is none, and always for
+// the plan approval and a question picker.
+func permissionSignature(screen string) string {
+	if term.PlanApproval(screen) || term.PickerSignature(screen) != "" {
+		return ""
+	}
+	if sig := term.PermissionSignature(screen); sig != "" {
+		return sig
+	}
+	return term.DialogSignature(screen) // PromptVisible's dialog
+}
+
+// refusal is why text may not be typed into the pane now: the dialog at
+// its bottom, as dialogOn names it (HTML). /approve and /deny are offered
+// only where they work, at the strict Bash dialog (ruling R38). "" when
+// nothing is in the way.
+func refusal(name, screen string) string {
+	switch dialogOn(screen) {
+	case dialogPlan:
+		return bold(name) + " is waiting on a plan approval; answer it on the Mac"
+	case dialogQuestion:
+		return bold(name) + " is waiting on a question; answer it on the Mac"
+	case dialogPartial:
+		return bold(name) + " shows a question tg can't read fully; answer it on the Mac"
+	case dialogPermission:
+		if term.BashDialog(screen) != "" {
+			return bold(name) + " is waiting on a permission prompt; answer it on the Mac, or send /approve or /deny"
+		}
+		return bold(name) + " is waiting on a permission prompt; answer it on the Mac"
+	}
+	return ""
+}
+
 // awaitInput polls the pane's input line until it reads want (ok), or until
 // it has stopped changing for readSettle without matching (not ok; got is
 // the settled text), or readTimeout passes. Claude Code renders typed text
@@ -372,7 +471,7 @@ func (r *Router) awaitInput(ctx context.Context, p term.Pane, want string) (got 
 		if err != nil {
 			return "", false, err
 		}
-		if term.PromptVisible(screen) {
+		if dialogOn(screen) != dialogNone {
 			return "", false, errDialog
 		}
 		got = normalize(InputText(screen))
@@ -510,16 +609,15 @@ func (r *Router) handleCallback(ctx context.Context, cq *telegram.CallbackQuery)
 		r.logf("dropped callback from %v", cq.From)
 		return nil
 	}
-	answer := func(text string) {
-		if err := r.API.AnswerCallbackQuery(ctx, cq.ID, clipText(text, 200)); err != nil {
-			r.logf("answer callback: %v", err)
-		}
+	if strings.HasPrefix(cq.Data, "a:") {
+		return r.tap(ctx, cq)
 	}
+	answer := func(text string) { r.answerCallback(ctx, cq, text) }
 	edit := func(html string) {
 		if cq.Message == nil {
 			return
 		}
-		if err := r.API.EditMessageText(ctx, r.ChatID, cq.Message.MessageID, html, "HTML"); err != nil {
+		if err := r.edit(ctx, cq.Message.MessageID, html); err != nil {
 			r.logf("edit: %v", err)
 		}
 	}
@@ -584,11 +682,14 @@ Every message here comes from one Claude Code session; its name is in bold at th
 • With exactly one followed session, plain text goes there. Otherwise I ask which session and show buttons.
 Your text is typed into the session as its next prompt, and that session's next answer comes back here.
 
-<b>Permission prompts</b> 🔐
-When a session waits for your approval, plain text is refused until you decide:
-<code>/approve</code> — chooses "Yes" (types 1)
-<code>/deny</code> — cancels (sends Esc)
-Target it by replying to the 🔐 message, or <code>/approve @name</code>.
+<b>Questions and permission prompts</b> 🔐 ✋
+While you are away from the Mac, a session's question or permission prompt comes here with buttons.
+• Tap a button to answer. ✅ Yes approves, ❌ No denies and stops the turn. A question takes the option you tap; with several allowed, tick them, then tap Done.
+• Or reply to the message (swipe it): your text answers a question, or denies a permission prompt and tells Claude why.
+Until you answer, other text for that session is refused.
+The fallback commands <code>/approve</code> and <code>/deny</code> answer a prompt that has buttons here like ✅ Yes and ❌ No. With none here, they type only into a plain Bash or Read "Do you want to proceed?" dialog (1, or Esc); any other prompt is answered at the Mac.
+Plan approval, MCP tool prompts and subagent prompts have no buttons: answer them at the Mac.
+Target them by replying to the 🔐 message (that prompt, and only while it is open), or <code>/approve @name</code> (the newest).
 
 <b>Following a session</b> 💬
 <code>/follow name</code> — every answer of that session comes here
@@ -675,7 +776,22 @@ func (r *Router) setFollow(ctx context.Context, m *telegram.Message, arg string,
 	return r.reply(ctx, m, "stopped following "+bold(l.Name))
 }
 
+// decide is /approve or /deny. Sent as a reply to a prompt's message, it
+// decides that prompt and no other, and is refused when that prompt is
+// closed or gone. Addressed to a session (@name, or the single followed
+// session), it decides the session's newest prompt on the phone; with none
+// there it types into the strict Bash dialog on the pane.
 func (r *Router) decide(ctx context.Context, m *telegram.Message, arg string, approve bool) error {
+	reply := arg == "" && m.ReplyToMessage != nil
+	if reply {
+		id := m.ReplyToMessage.MessageID
+		if a, _, ok := r.Store.FindAskByMessageID(id); ok {
+			return r.decideReplied(ctx, m, a, approve)
+		}
+		if sess, ok := r.Store.FindSessionByMessageID(id); ok && sess.AskMessage(id) {
+			return r.reply(ctx, m, promptClosed)
+		}
+	}
 	live, err := r.live(ctx)
 	if err != nil {
 		return r.reply(ctx, m, "cannot list sessions: "+render.EscapeHTML(err.Error()))
@@ -684,6 +800,19 @@ func (r *Router) decide(ctx context.Context, m *telegram.Message, arg string, ap
 	if l == nil {
 		return r.reply(ctx, m, why)
 	}
+	// A prompt of the session on the phone is decided there, like a tap on
+	// its ✅ Yes or ❌ No; nothing is typed (ruling R38).
+	asks, err := r.sentAsks(l)
+	if err != nil {
+		return r.reply(ctx, m, err.Error())
+	}
+	if len(asks) > 0 {
+		if reply {
+			// A reply to another message of the session names no prompt.
+			return r.reply(ctx, m, onThePhone(l.Name))
+		}
+		return r.decideAsk(ctx, m, l.Name, asks, approve)
+	}
 	if err := r.reachable(ctx, l); err != nil {
 		return r.reply(ctx, m, err.Error())
 	}
@@ -691,16 +820,24 @@ func (r *Router) decide(ctx context.Context, m *telegram.Message, arg string, ap
 	if err != nil {
 		return r.reply(ctx, m, "cannot read "+bold(l.Name)+": "+render.EscapeHTML(err.Error()))
 	}
-	sig := term.DialogSignature(screen)
+	// Without one, only the strict v0.2 Bash dialog is typed into: in any
+	// other dialog, a picker or the plan approval, a digit may pick an
+	// option that is not "Yes", and the phone's buttons cover them better.
+	sig := term.BashDialog(screen)
 	if sig == "" {
+		if dialogOn(screen) != dialogNone {
+			return r.reply(ctx, m, bold(l.Name)+" shows a prompt tg can't answer from here; answer it on the Mac")
+		}
 		return r.reply(ctx, m, "no permission prompt visible in "+bold(l.Name))
 	}
 	// Read again right before the keystroke: the dialog must be the same one.
 	again, err := r.Term.Screen(ctx, l.Pane, screenLines)
-	if err != nil || term.DialogSignature(again) != sig {
+	if err != nil || term.BashDialog(again) != sig {
 		return r.reply(ctx, m, "the dialog in "+bold(l.Name)+" changed between two looks; check it and try again")
 	}
-	keys, emoji, word := "1"+term.Enter, "👌", "approved"
+	// A digit alone picks the option at once (spec fact 12); an Enter after
+	// it could confirm the next queued dialog or submit a draft.
+	keys, emoji, word := "1", "👌", "approved"
 	if !approve {
 		keys, emoji, word = term.Escape, "👎", "denied"
 	}

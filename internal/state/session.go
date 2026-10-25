@@ -11,6 +11,7 @@ import (
 	"github.com/IZZY-Agency/claude-tg/internal/term"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -21,7 +22,7 @@ type Store struct{ Dir string }
 
 // Open creates the directory layout (0700) and returns the store.
 func Open(dir string) (*Store, error) {
-	for _, d := range []string{dir, filepath.Join(dir, "sessions"), filepath.Join(dir, "spool")} {
+	for _, d := range []string{dir, filepath.Join(dir, "sessions"), filepath.Join(dir, "spool"), filepath.Join(dir, "asks")} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return nil, err
 		}
@@ -53,7 +54,20 @@ type Session struct {
 	NameResolvedAt    time.Time `json:"name_resolved_at,omitempty"`
 	EndedAt           time.Time `json:"ended_at,omitempty"`
 	LastMessageIDs    []int64   `json:"last_message_ids,omitempty"`
+	AskMessageIDs     []int64   `json:"ask_message_ids,omitempty"` // which of them carried a prompt's buttons (SendButtons)
+	AskCredits        []string  `json:"ask_credits,omitempty"`     // asks answered from the phone, each owing the phone one answer of the session (ArmAsk)
 	PendingPermission *Pending  `json:"pending_permission,omitempty"`
+}
+
+// AskMessage reports whether message id carried a question's or permission
+// prompt's buttons, whether or not its ask is still there.
+func (s *Session) AskMessage(id int64) bool {
+	for _, m := range s.AskMessageIDs {
+		if m == id {
+			return true
+		}
+	}
+	return false
 }
 
 // Pane is the terminal pane the relay types into. tmux wins over agterm: a
@@ -116,7 +130,13 @@ func (s *Store) SaveSession(sess *Session) error {
 // UpdateSession loads the session, applies fn and saves it, all under a
 // per-session lock so concurrent hooks never lose each other's changes.
 func (s *Store) UpdateSession(id string, fn func(*Session)) (*Session, error) {
-	release, err := lockFile(context.Background(), s.sessionPath(id)+".lock")
+	return s.UpdateSessionCtx(context.Background(), id, fn)
+}
+
+// UpdateSessionCtx is UpdateSession waiting for the session's lock only
+// until ctx ends (it tries once even then), for a caller in a hurry.
+func (s *Store) UpdateSessionCtx(ctx context.Context, id string, fn func(*Session)) (*Session, error) {
+	release, err := lockFile(ctx, s.sessionPath(id)+".lock")
 	if err != nil {
 		return nil, err
 	}
@@ -172,4 +192,63 @@ func writeAtomic(path string, v any) error {
 		return err
 	}
 	return nil
+}
+
+// keepCredits bounds a session's ask credits: a session that never stops
+// again must not grow them for good.
+const keepCredits = 50
+
+// ArmAsk makes the session owe the phone its next answer for ask id,
+// answered from the phone, with a credit of its own (AskCredits), so
+// taking it back later (DropAsk) never takes another answer's. It reports
+// whether it added one: a followed session reports every answer anyway,
+// and an ask is credited once.
+func (s *Session) ArmAsk(id string) bool {
+	if s.Follow || slices.Contains(s.AskCredits, id) {
+		return false
+	}
+	s.AskCredits = append(s.AskCredits, id)
+	if n := len(s.AskCredits); n > keepCredits {
+		s.AskCredits = s.AskCredits[n-keepCredits:]
+	}
+	return true
+}
+
+// DropAsk takes back ask id's credit when its answer never reached Claude
+// Code, and reports whether it was there: once spent (TakeAnswer) or taken
+// back, there is nothing to drop.
+func (s *Session) DropAsk(id string) bool {
+	i := slices.Index(s.AskCredits, id)
+	if i < 0 {
+		return false
+	}
+	s.AskCredits = slices.Delete(s.AskCredits, i, i+1)
+	return true
+}
+
+// TakeAnswer spends one answer owed to the phone, for the Stop hook: the
+// oldest ask credit first, else one of a typed reply's (PendingAnswers).
+// It reports whether one was owed.
+func (s *Session) TakeAnswer() bool {
+	switch {
+	case len(s.AskCredits) > 0:
+		s.AskCredits = s.AskCredits[1:]
+	case s.PendingAnswers > 0:
+		s.PendingAnswers--
+	default:
+		return false
+	}
+	return true
+}
+
+// Owed is how many of its answers the session owes the phone.
+func (s *Session) Owed() int { return s.PendingAnswers + len(s.AskCredits) }
+
+// TakeBackAnswer drops ask askID's credit (DropAsk) when its answer never
+// reached Claude Code, under the session's lock, waiting for that lock
+// only until ctx ends. Running it again, or after the credit was spent,
+// changes nothing.
+func (s *Store) TakeBackAnswer(ctx context.Context, sessionID, askID string) error {
+	_, err := s.UpdateSessionCtx(ctx, sessionID, func(sess *Session) { sess.DropAsk(askID) })
+	return err
 }

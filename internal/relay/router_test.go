@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -178,6 +179,30 @@ func TestNoTargetShowsKeyboardAndCallbackDelivers(t *testing.T) {
 	}
 }
 
+// The session chooser's buttons carry session names: their texts are
+// masked like every other text the relay sends; the callback data is not.
+func TestSessionChooserMasksButtonTexts(t *testing.T) {
+	const bot = "123456:ABCDEFsecretbot"
+	f := newFixture(t)
+	f.r.Secrets = []string{bot}
+	f.r.Agents = relaytest.AgentsOf(
+		session.Agent{SessionID: sidShop, Name: "bot" + bot, Kind: "interactive", Status: "idle", Cwd: "/Users/alex/code/acme-shop"},
+		session.Agent{SessionID: sidShopF, Name: "deploy token=abcdefgh1234", Kind: "interactive", Status: "busy", Cwd: "/Users/alex/code/acme-shop"},
+	)
+	f.handle(t, f.msg("please rerun", 0))
+	kb := f.api.Sent[len(f.api.Sent)-1].InlineKeyboard
+	if len(kb) != 2 {
+		t.Fatalf("keyboard = %+v", kb)
+	}
+	got := []string{kb[0][0].Text, kb[1][0].Text}
+	if want := []string{"bot[redacted] · idle", "deploy token=[redacted] · busy"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("buttons = %q, want %q", got, want)
+	}
+	if !strings.HasPrefix(kb[0][0].Data, "s:"+sidShop+":") || !strings.HasPrefix(kb[1][0].Data, "s:"+sidShopF+":") {
+		t.Fatalf("callback data changed: %+v", kb)
+	}
+}
+
 func TestCallbackExpired(t *testing.T) {
 	f := newFixture(t)
 	_, _ = f.store.UpdateSession(sidBlog, func(s *state.Session) { s.Follow = false })
@@ -203,7 +228,9 @@ func TestPermissionPromptBlocksText(t *testing.T) {
 func TestApproveTypesOneAndReacts(t *testing.T) {
 	f := newFixture(t)
 	f.handle(t, f.msg("/approve", 120))
-	f.typedOnce(t, "A3", "1\n")
+	// A digit alone picks the option (spec fact 12); an Enter after it
+	// could confirm the next queued dialog or submit a draft.
+	f.typedOnce(t, "A3", "1")
 	if len(f.api.Reactions) != 1 || f.api.Reactions[0].Emoji != "👌" {
 		t.Fatalf("reactions=%+v", f.api.Reactions)
 	}
@@ -386,26 +413,200 @@ func TestTextIsVerifiedBeforeEnter(t *testing.T) {
 	}
 }
 
+// Enter in a dialog confirms its first option: a permission dialog of any
+// tool, or a question picker, that pops up while the text is typed
+// withholds it (ruling R28).
 func TestDialogAppearingBeforeEnterBlocksSubmit(t *testing.T) {
-	f := newFixture(t)
-	perm := f.term.Screens["A3"]
-	f.term.OnType = func(id, text string) {
-		if id == "A1" {
-			f.term.Screens["A1"] = perm // a dialog pops up right after the text was typed
+	for _, name := range []string{"permission-screen.txt", "edit-dialog.txt", "webfetch-dialog.txt", "picker-single.txt", "plan-approval.txt"} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			dialog := termScreen(t, name)
+			f.term.OnType = func(id, text string) {
+				if id == "A1" {
+					f.term.Screens["A1"] = dialog // a dialog pops up right after the text was typed
+				}
+			}
+			f.handle(t, f.msg("1 more thing", 101))
+			for _, x := range f.term.Typed {
+				if x.Text == "\n" {
+					t.Fatal("Enter must not be sent when a dialog appeared")
+				}
+			}
+			if last := f.api.LastText(); last != "a permission prompt or question appeared in <b>acme-shop-92</b> while typing; your text was not submitted. Answer it, then send the text again" {
+				t.Fatalf("last=%q", last)
+			}
+			if len(f.api.Reactions) != 0 {
+				t.Fatal("no 👍 for an unsubmitted text")
+			}
+		})
+	}
+}
+
+// Ruling R28: text is never typed into a permission dialog of any tool or
+// into a question picker, whether or not a waiting hook handles it. Real
+// screens. /approve and /deny are offered only where they work: the strict
+// Bash dialog (ruling R38).
+func TestDialogsAndPickersRefuseTyping(t *testing.T) {
+	const (
+		prompt   = "<b>acme-shop-92</b> is waiting on a permission prompt; answer it on the Mac, or send /approve or /deny"
+		other    = "<b>acme-shop-92</b> is waiting on a permission prompt; answer it on the Mac"
+		question = "<b>acme-shop-92</b> is waiting on a question; answer it on the Mac"
+		plan     = "<b>acme-shop-92</b> is waiting on a plan approval; answer it on the Mac"
+	)
+	cases := map[string]struct{ screen, want string }{
+		"permission-screen.txt":                        {termScreen(t, "permission-screen.txt"), prompt},
+		"bash-gutter-100.txt":                          {termScreen(t, "bash-gutter-100.txt"), prompt},
+		"read-outside-dialog.txt":                      {termScreen(t, "read-outside-dialog.txt"), prompt},
+		"edit-dialog.txt":                              {termScreen(t, "edit-dialog.txt"), other},
+		"write-dialog.txt":                             {termScreen(t, "write-dialog.txt"), other},
+		"write-overwrite-dialog.txt":                   {termScreen(t, "write-overwrite-dialog.txt"), other},
+		"webfetch-dialog.txt":                          {termScreen(t, "webfetch-dialog.txt"), other},
+		"a plan option scrolled above the Bash dialog": {bashWithPlanAbove(t), other},
+		"plan-approval.txt":                            {termScreen(t, "plan-approval.txt"), plan},
+		"the plan at 80 columns with a question line":  {planAt80WithQuestion(t), plan},
+		"picker-single.txt":                            {termScreen(t, "picker-single.txt"), question},
+		"picker-single-typing.txt":                     {termScreen(t, "picker-single-typing.txt"), question},
+		"picker-multi-q1.txt":                          {termScreen(t, "picker-multi-q1.txt"), question},
+		"picker-preview.txt":                           {termScreen(t, "picker-preview.txt"), question},
+		"a picker asking to proceed":                   {pickerAskingToProceed(t), question},
+		// The review screen has no footer; a digit submits or cancels it.
+		"picker-multi-review.txt":      {termScreen(t, "picker-multi-review.txt"), question},
+		"picker-multi-review-none.txt": {termScreen(t, "picker-multi-review-none.txt"), question},
+		"picker-multi-review-all.txt":  {termScreen(t, "picker-multi-review-all.txt"), question},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			f.term.Screens["A1"] = c.screen
+			f.handle(t, f.msg("@acme-shop-92 run the tests", 0))
+			if len(f.term.Typed) != 0 || f.api.LastText() != c.want {
+				t.Fatalf("typed = %+v last = %q, want %q", f.term.Typed, f.api.LastText(), c.want)
+			}
+		})
+	}
+}
+
+// A read that shows the picker's marks but does not hold a picker whole
+// (its review screen cut to its last lines, its footer clipped at the
+// pane's edge) is refused for typing all the same; so are pickers whose
+// tab bar is clipped or scrolled, or whose top is above the read. The
+// relay reads 60 lines, as the waiting hook does.
+func TestPartialPickersRefuseTyping(t *testing.T) {
+	const (
+		partial  = "<b>acme-shop-92</b> shows a question tg can't read fully; answer it on the Mac"
+		question = "<b>acme-shop-92</b> is waiting on a question; answer it on the Mac"
+	)
+	swap := func(s, old, new string) string {
+		if !strings.Contains(s, old) {
+			t.Fatalf("%q not on the screen", old)
+		}
+		return strings.Replace(s, old, new, 1)
+	}
+	tail := func(s string, n int) string {
+		lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+		return strings.Join(lines[len(lines)-n:], "\n") + "\n"
+	}
+	const bar = "←  ☐ Colours  ☐ Pet  ✔ Submit  →"
+	for name, c := range map[string]struct{ screen, want string }{
+		"review cut":           {tail(termScreen(t, "picker-multi-review-none.txt"), 5), partial},
+		"footer clipped":       {swap(termScreen(t, "picker-single.txt"), "Enter to select · ↑/↓ to navigate · Esc to cancel", "Enter to sel"), partial},
+		"tab bar clipped":      {swap(termScreen(t, "picker-multi-q1.txt"), bar, "←  ☐ Colours  ☐ Pet  ✔ Sub"), question},
+		"tab bar scrolled":     {swap(termScreen(t, "picker-multi-q2-untouched.txt"), bar, "←  ☐ Pet  ✔ Submit  →"), question},
+		"taller than the read": {tail(termScreen(t, "picker-multi-q2-untouched.txt"), 11), question},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			f.term.Screens["A1"] = c.screen
+			f.handle(t, f.msg("@acme-shop-92 run the tests", 0))
+			if len(f.term.Typed) != 0 || f.api.LastText() != c.want {
+				t.Fatalf("typed = %+v last = %q, want %q", f.term.Typed, f.api.LastText(), c.want)
+			}
+			for _, n := range f.term.ScreenLines {
+				if n != 60 {
+					t.Fatalf("read %v lines, want 60", f.term.ScreenLines)
+				}
+			}
+		})
+	}
+}
+
+// rewrap is the screen redrawn at width columns, as a narrower terminal
+// draws it: a rule is cut, a longer text line breaks between words and
+// continues with one space of indent (so the plan approval's question ends
+// " Would you like to" / " proceed?").
+func rewrap(s string, width int) string {
+	var out []string
+	for _, l := range strings.Split(s, "\n") {
+		l = strings.TrimRight(l, " ")
+		r := []rune(l)
+		switch {
+		case len(r) <= width:
+			out = append(out, l)
+		case strings.Trim(strings.TrimSpace(l), "─╌") == "":
+			out = append(out, string(r[:width]))
+		default:
+			line := ""
+			for _, w := range strings.Fields(l) {
+				if line != "" && len([]rune(line))+1+len([]rune(w)) > width {
+					out = append(out, line)
+					line = " " + w
+				} else if line == "" {
+					line = " " + w
+				} else {
+					line += " " + w
+				}
+			}
+			out = append(out, line)
 		}
 	}
-	f.handle(t, f.msg("1 more thing", 101))
-	for _, x := range f.term.Typed {
-		if x.Text == "\n" {
-			t.Fatal("Enter must not be sent when a dialog appeared")
-		}
+	return strings.Join(out, "\n")
+}
+
+// planAt80WithQuestion is the real plan approval, with a plan line that
+// reads like a dialog's question, read at 80 columns: its question wraps
+// before "proceed?".
+func planAt80WithQuestion(t *testing.T) string {
+	t.Helper()
+	plan := strings.Replace(termScreen(t, "plan-approval.txt"), "\n Steps\n", "\n Do you want to keep the old flag? Open question.\n\n Steps\n", 1)
+	w := rewrap(plan, 80)
+	if !strings.Contains(w, "Would you like to\n proceed?\n") || !strings.Contains(w, "Do you want to keep the old flag?") {
+		t.Fatalf("plan screen not as intended:\n%s", w)
 	}
-	if !strings.Contains(f.api.LastText(), "not submitted") {
-		t.Fatalf("last=%q", f.api.LastText())
+	return w
+}
+
+// pickerAskingToProceed is the real single-choice picker asking "Do you
+// want to proceed?", with those words in the transcript above it too.
+func pickerAskingToProceed(t *testing.T) string {
+	t.Helper()
+	s := termScreen(t, "picker-single.txt")
+	out := strings.Replace(s, "\nWhich fruit do you want for the picker probe?\n", "\nDo you want to proceed?\n", 1)
+	out = strings.Replace(out, "\n──", "\n⏺ I will ask with a picker: Do you want to proceed? Apple, Banana or Cherry.\n──", 1)
+	if strings.Count(out, "Do you want to proceed?") != 2 {
+		t.Fatal("picker screen not changed")
 	}
-	if len(f.api.Reactions) != 0 {
-		t.Fatal("no 👍 for an unsubmitted text")
+	return out
+}
+
+// bashWithPlanAbove is the real Bash dialog with one of the plan approval's
+// option lines still on the read above it: a plan marker anywhere in the
+// read means nothing is typed (ruling R38).
+func bashWithPlanAbove(t *testing.T) string {
+	t.Helper()
+	s := strings.Replace(termScreen(t, "permission-screen.txt"), "\n⏺ Skill(telegram-notify)\n", "\n   2. Yes, manually approve edits\n", 1)
+	if !strings.Contains(s, "manually approve edits") {
+		t.Fatal("Bash screen not changed")
 	}
+	return s
+}
+
+func termScreen(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("..", "term", "testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
 
 func TestApproveRefusesWhenDialogChangesBetweenReads(t *testing.T) {
@@ -657,4 +858,143 @@ func TestInputReadBackWaitsForLaggingRender(t *testing.T) {
 	if f.slept == 0 {
 		t.Fatal("the relay never waited for the pane")
 	}
+}
+
+// The relay's own replies are redacted between their tags, like every
+// other text tg sends: an echoed secret is masked and the HTML stays valid.
+func TestRepliesAreRedacted(t *testing.T) {
+	f := newFixture(t)
+	f.handle(t, f.msg("/follow password=s3cr3tvalue", 0))
+	if got := f.api.LastText(); got != "no live session matches <b>password=[redacted]</b>" {
+		t.Fatalf("reply = %q", got)
+	}
+}
+
+// cantAnswer is /approve's and /deny's refusal for any dialog but the strict
+// Bash dialog when no prompt of the session is on the phone (ruling R38).
+const cantAnswer = "<b>blog-6a</b> shows a prompt tg can't answer from here; answer it on the Mac"
+
+// Ruling R38: without a prompt on the phone, /approve and /deny type only
+// into the strict v0.2 Bash dialog ("Do you want to proceed?" with the
+// "Esc to cancel · Tab to amend" footer; the Read dialog shares the layout),
+// read twice and the same both times: `1` alone (R37), or Esc. Every other
+// screen is refused: Edit, Write and WebFetch dialogs, the plan approval
+// (also wrapped at 80 columns, with a plan line that reads like a dialog's
+// question), a question picker (also one asking "Do you want to
+// proceed?"), and a Bash dialog with a plan option still on the read.
+func TestApproveAndDenyTypeOnlyIntoTheBashDialog(t *testing.T) {
+	for _, name := range []string{"permission-screen.txt", "bash-gutter-100.txt", "bash-heredoc-dialog.txt", "read-outside-dialog.txt"} {
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(termScreen(t, name), "❯ 1. Yes\n") {
+				t.Fatalf("%s: option 1 is not Yes", name)
+			}
+			f := newFixture(t)
+			f.term.Screens["A3"] = termScreen(t, name)
+			f.handle(t, f.msg("/approve", 120))
+			f.typedOnce(t, "A3", "1")
+			f.term.Typed = nil
+			f.handle(t, f.msg("/deny @blog", 0))
+			f.typedOnce(t, "A3", "\x1b")
+			if len(f.api.Reactions) != 2 || f.api.Reactions[0].Emoji != "👌" || f.api.Reactions[1].Emoji != "👎" {
+				t.Fatalf("reactions=%+v", f.api.Reactions)
+			}
+		})
+	}
+	t.Run("the dialog changes between the two reads", func(t *testing.T) {
+		f := newFixture(t)
+		other := termScreen(t, "bash-gutter-100.txt")
+		f.term.NextScreen = func(call int, id string) (string, bool) { return other, call == 2 }
+		f.handle(t, f.msg("/approve", 120))
+		if len(f.term.Typed) != 0 || !strings.Contains(f.api.LastText(), "changed") {
+			t.Fatalf("typed=%+v last=%q", f.term.Typed, f.api.LastText())
+		}
+	})
+	refused := map[string]string{
+		"edit-dialog.txt": termScreen(t, "edit-dialog.txt"), "edit-subdir-dialog.txt": termScreen(t, "edit-subdir-dialog.txt"),
+		"write-dialog.txt": termScreen(t, "write-dialog.txt"), "write-overwrite-dialog.txt": termScreen(t, "write-overwrite-dialog.txt"),
+		"webfetch-dialog.txt": termScreen(t, "webfetch-dialog.txt"), "plan-approval.txt": termScreen(t, "plan-approval.txt"),
+		"the plan at 80 columns with a question line":  planAt80WithQuestion(t),
+		"picker-single.txt":                            termScreen(t, "picker-single.txt"),
+		"a picker asking to proceed":                   pickerAskingToProceed(t),
+		"a plan option scrolled above the Bash dialog": bashWithPlanAbove(t),
+	}
+	for name, screen := range refused {
+		for _, cmd := range []string{"/approve", "/deny @blog"} {
+			t.Run(cmd+" on "+name, func(t *testing.T) {
+				f := newFixture(t)
+				f.term.Screens["A3"] = screen
+				f.handle(t, f.msg(cmd, 120))
+				if len(f.term.Typed) != 0 || f.api.LastText() != cantAnswer || len(f.api.Reactions) != 0 {
+					t.Fatalf("typed=%+v last=%q reactions=%+v, want %q", f.term.Typed, f.api.LastText(), f.api.Reactions, cantAnswer)
+				}
+			})
+		}
+	}
+}
+
+// A plan whose text has a line starting "Do you want to …" over its
+// numbered options is still the plan approval: /approve would pick "Yes,
+// and use auto mode". /approve, /deny and typed text are all refused, at
+// the recorded width and at 80 columns, where the question wraps.
+func TestPlanWithAQuestionLineIsNeverApproved(t *testing.T) {
+	plan := strings.Replace(termScreen(t, "plan-approval.txt"), "\n Steps\n", "\n Do you want to keep the old flag? Open question.\n\n Steps\n", 1)
+	const typing = "<b>blog-6a</b> is waiting on a plan approval; answer it on the Mac"
+	for name, screen := range map[string]string{"recorded": plan, "80 columns": planAt80WithQuestion(t)} {
+		for text, want := range map[string]string{"/approve": cantAnswer, "/deny": cantAnswer, "go ahead": typing} {
+			f := newFixture(t)
+			f.term.Screens["A3"] = screen
+			f.handle(t, f.msg(text, 120))
+			if len(f.term.Typed) != 0 || f.api.LastText() != want {
+				t.Errorf("%s, %s: typed=%+v last=%q, want %q", name, text, f.term.Typed, f.api.LastText(), want)
+			}
+		}
+	}
+}
+
+// Round 5: a pane narrower than the picker's footer wraps it; the picker
+// is still refused for typing and by /approve and /deny, also when its
+// option descriptions quote the Bash dialog's question and footer. The
+// ticked multi-select picker has no prompt line above it: the fake
+// terminal must leave its cursor line alone. An Edit dialog whose
+// directory name holds the Bash strings is refused by /approve too.
+func TestNarrowPickersAndInjectedStringsRefuse(t *testing.T) {
+	const question = "<b>blog-6a</b> is waiting on a question; answer it on the Mac"
+	quoting := strings.Replace(termScreen(t, "picker-single.txt"), "     A crisp red apple", "     Do you want to proceed?", 1)
+	quoting = strings.Replace(quoting, "     A ripe yellow banana", "     Esc to cancel · Tab to amend", 1)
+	ticked := termScreen(t, "picker-multi-q1-ticked.txt")
+	if strings.HasPrefix(ticked, "❯") || !strings.Contains(ticked, "\n❯ 1. [✔] Red\n") {
+		t.Fatal("the ticked picker is not as expected")
+	}
+	pickers := map[string]string{
+		"single at 40": rewrap(termScreen(t, "picker-single.txt"), 40), "single at 46": rewrap(termScreen(t, "picker-single.txt"), 46),
+		"multi at 56":   rewrap(termScreen(t, "picker-multi-q1.txt"), 56),
+		"preview at 46": rewrap(termScreen(t, "picker-preview.txt"), 46), "preview at 50": rewrap(termScreen(t, "picker-preview.txt"), 50),
+		"typing at 70":                 rewrap(termScreen(t, "picker-single-typing.txt"), 70),
+		"ticked, no prompt line above": ticked, "ticked at 56": rewrap(ticked, 56),
+		"quoting the Bash dialog at 46": rewrap(quoting, 46), "quoting the Bash dialog at 40": rewrap(quoting, 40),
+	}
+	for name, s := range pickers {
+		t.Run(name, func(t *testing.T) {
+			for text, want := range map[string]string{"go ahead": question, "/approve": cantAnswer, "/deny": cantAnswer} {
+				f := newFixture(t)
+				f.term.Screens["A3"] = s
+				f.handle(t, f.msg(text, 120))
+				if len(f.term.Typed) != 0 || f.api.LastText() != want {
+					t.Errorf("%s: typed=%+v last=%q, want %q", text, f.term.Typed, f.api.LastText(), want)
+				}
+			}
+		})
+	}
+	t.Run("an Edit with the Bash strings in its directory name", func(t *testing.T) {
+		edit := strings.Replace(termScreen(t, "edit-outside-dialog.txt"), "      /Users/alex/scratch/fix2 for this session (shift+tab)",
+			"      /Users/alex/scratch/fix2\nDo you want to proceed?\n Esc to cancel · Tab to amend\n      for this session (shift+tab)", 1)
+		for _, cmd := range []string{"/approve", "/deny"} {
+			f := newFixture(t)
+			f.term.Screens["A3"] = edit
+			f.handle(t, f.msg(cmd, 120))
+			if len(f.term.Typed) != 0 || f.api.LastText() != cantAnswer {
+				t.Errorf("%s: typed=%+v last=%q, want %q", cmd, f.term.Typed, f.api.LastText(), cantAnswer)
+			}
+		}
+	})
 }

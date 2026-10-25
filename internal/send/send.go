@@ -139,14 +139,30 @@ func clip(s string, max int) string {
 	return string(r[:max-1]) + "…"
 }
 
-func (s *Sender) scrub(text string) string {
-	for _, sec := range s.Secrets {
+func (s *Sender) scrub(text string) string { return Scrub(text, s.Secrets) }
+
+// Scrub replaces every occurrence of each secret (the bot token) in text
+// with "[redacted]". Its tags and entities aside, HTML is scrubbed alike: a
+// bot token has no character HTML escapes.
+func Scrub(text string, secrets []string) string {
+	for _, sec := range secrets {
 		if sec != "" {
 			text = strings.ReplaceAll(text, sec, "[redacted]")
 		}
 	}
 	return text
 }
+
+// Clean is what SendButtons does to its plain text and button texts: the
+// bot token and other configured secrets scrubbed, then credentials
+// redacted. It is for raw text only; HTML takes CleanHTML. Callers that
+// store a sent text, or edit it later, apply the same one themselves.
+func (s *Sender) Clean(text string) string { return render.Redact(s.scrub(text)) }
+
+// CleanHTML is Clean for HTML, what SendButtons does to its html: the
+// secrets scrubbed, then credentials redacted between the tags only, so
+// no tag is swallowed.
+func (s *Sender) CleanHTML(html string) string { return render.RedactHTML(s.scrub(html)) }
 
 func (s *Sender) now() time.Time {
 	if s.Now != nil {
@@ -165,7 +181,7 @@ func (s *Sender) logf(format string, args ...any) {
 // messages are still undelivered, m is queued behind them instead of
 // overtaking them.
 func (s *Sender) Send(ctx context.Context, m Message) ([]int64, error) {
-	m.Label, m.Title, m.Body = s.scrub(m.Label), s.scrub(m.Title), render.Redact(s.scrub(m.Body))
+	m.Label, m.Title, m.Body = s.scrub(m.Label), s.scrub(m.Title), s.Clean(m.Body)
 	chunks := render.Truncate(render.Chunk(m.Body, render.SourceChunk), render.MaxChunks)
 	if len(chunks) == 0 {
 		chunks = []string{""}
@@ -188,13 +204,13 @@ func (s *Sender) Send(ctx context.Context, m Message) ([]int64, error) {
 		id, err := s.deliver(ctx, req, plain)
 		if err != nil {
 			if temporary(err) {
-				s.record(m.SessionID, ids)
+				s.record(m.SessionID, ids, false)
 				if serr := s.spoolFrom(m, chunks, i, first); serr != nil {
 					return ids, fmt.Errorf("%w: %v (after %v)", ErrLost, serr, err)
 				}
 				return ids, fmt.Errorf("%w: %v", ErrSpooled, err)
 			}
-			s.record(m.SessionID, ids)
+			s.record(m.SessionID, ids, false)
 			return ids, err
 		}
 		ids = append(ids, id)
@@ -202,8 +218,30 @@ func (s *Sender) Send(ctx context.Context, m Message) ([]int64, error) {
 			first = id
 		}
 	}
-	s.record(m.SessionID, ids)
+	s.record(m.SessionID, ids, false)
 	return ids, nil
+}
+
+// SendButtons posts one message with an inline keyboard. It is never spooled:
+// buttons delivered hours late would mislead, so a failure is returned for the
+// caller to retry. html (CleanHTML), plain and every button text (Clean)
+// are redacted; callback data is passed through untouched.
+func (s *Sender) SendButtons(ctx context.Context, sessionID, html, plain string, kb [][]telegram.Button) (int64, error) {
+	html, plain = s.CleanHTML(html), s.Clean(plain)
+	keyboard := make([][]telegram.Button, len(kb))
+	for i, row := range kb {
+		keyboard[i] = make([]telegram.Button, len(row))
+		for j, b := range row {
+			keyboard[i][j] = telegram.Button{Text: s.Clean(b.Text), Data: b.Data}
+		}
+	}
+	req := telegram.SendRequest{ChatID: s.ChatID, Text: html, ParseMode: "HTML", InlineKeyboard: keyboard}
+	id, err := s.deliver(ctx, req, plain)
+	if err != nil {
+		return 0, err
+	}
+	s.record(sessionID, []int64{id}, true)
+	return id, nil
 }
 
 // temporary reports errors worth retrying later: transport failures,
@@ -293,16 +331,27 @@ func newID(t time.Time, i int) string {
 	return fmt.Sprintf("%d-%02d-%s", t.UnixNano(), i, hex.EncodeToString(b[:]))
 }
 
-func (s *Sender) record(sessionID string, ids []int64) {
+// record notes the session's sent messages, so a reply to one finds the
+// session; prompt marks the message of a question or permission prompt
+// (Session.AskMessage), so a reply to it never reaches another prompt.
+func (s *Sender) record(sessionID string, ids []int64, prompt bool) {
 	if sessionID == "" || len(ids) == 0 {
 		return
 	}
 	_, _ = s.Store.UpdateSession(sessionID, func(sess *state.Session) {
-		sess.LastMessageIDs = append(sess.LastMessageIDs, ids...)
-		if n := len(sess.LastMessageIDs); n > keepIDs {
-			sess.LastMessageIDs = sess.LastMessageIDs[n-keepIDs:]
+		sess.LastMessageIDs = keepLast(append(sess.LastMessageIDs, ids...))
+		if prompt {
+			sess.AskMessageIDs = keepLast(append(sess.AskMessageIDs, ids...))
 		}
 	})
+}
+
+// keepLast is the last keepIDs ids.
+func keepLast(ids []int64) []int64 {
+	if n := len(ids); n > keepIDs {
+		return ids[n-keepIDs:]
+	}
+	return ids
 }
 
 // FlushSpool delivers up to max spooled items, oldest first, under the spool

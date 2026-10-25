@@ -1,0 +1,38 @@
+❯ Use the AskUserQuestion tool right now, with exactly one single-choice question: question "Which fruit do you want for the picker probe?", header "Fruit", options  
+  Apple (description "A crisp red apple"), Banana (description "A ripe yellow banana"), Cherry (description "A handful of cherries"). Do nothing else.                
+
+⏺ User declined to answer questions
+  ⎿  · Which fruit do you want for the picker probe? (Apple / Banana / Cherry)
+
+✻ Worked for 2s · done 6:59 PM
+  
+❯ Use the AskUserQuestion tool once more, now with exactly two questions in one call: 1) multi-select question "Which colours do you like for the probe?", header     
+  "Colours", options Red, Green, Blue (each with a one-word description); 2) single-choice question "Which pet suits the probe?", header "Pet", options Cat, Dog      
+  (each with a one-word description). Do nothing else.                                                                                                                
+
+⏺ User declined to answer questions
+  ⎿  · Which colours do you like for the probe? (Red / Green / Blue)
+     · Which pet suits the probe? (Cat / Dog)
+
+✻ Churned for 1s · done 7:00 PM
+
+❯ Use the AskUserQuestion tool once more with exactly one single-choice question "Which layout should the probe use?", header "Layout", and two options, each with a  
+  short markdown preview field showing a 3-line ASCII sketch: option "Grid" and option "List". Do nothing else.                                                       
+  
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Layout 
+
+Which layout should the probe use?
+
+❯ 1. Grid                         ┌──────────────────────────────────────────┐
+  2. List                         │ [ ][ ][ ]                                │
+                                  │ [ ][ ][ ]                                │
+                                  │ [ ][ ][ ]                                │
+                                  └──────────────────────────────────────────┘
+
+                                  Notes: press n to add notes
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel

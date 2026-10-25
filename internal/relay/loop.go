@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/IZZY-Agency/claude-tg/internal/state"
@@ -38,8 +39,14 @@ func (l *Loop) logf(format string, args ...any) {
 	}
 }
 
+// updateTime is when an update was sent, or zero when unknown. A callback
+// carries only its message's date; for an ask tap ("a:") that is when the
+// question was sent, not when it was tapped, so a tap has no usable time:
+// the ask itself says whether it still waits and takes an answer once.
 func updateTime(u telegram.Update) time.Time {
 	switch {
+	case u.CallbackQuery != nil && strings.HasPrefix(u.CallbackQuery.Data, "a:"):
+		return time.Time{}
 	case u.Message != nil && u.Message.Date != 0:
 		return time.Unix(u.Message.Date, 0)
 	case u.CallbackQuery != nil && u.CallbackQuery.Message != nil && u.CallbackQuery.Message.Date != 0:
@@ -65,9 +72,11 @@ func PartitionStale(ups []telegram.Update, now time.Time, maxAge time.Duration) 
 // Run holds the single-instance lock and polls until ctx ends (or, with
 // Once, until the first batch is handled). Every update is claimed (offset
 // saved) before it is acted on, so a crash never replays a keystroke; what
-// was in flight at the crash is lost, never repeated. While the startup
-// backlog drains, updates older than MaxAge are skipped and counted; one
-// notice reports the count.
+// was in flight at the crash is lost, never repeated. Updates older than
+// MaxAge (the startup backlog, or what piled up while the Mac slept) are
+// skipped and counted; ask taps have no date of their own and are never
+// skipped. While the startup backlog drains the count adds up; after that,
+// each batch that skipped anything sends one notice with its count.
 func (l *Loop) Run(ctx context.Context) error {
 	release, err := l.Store.LockRelay()
 	if err != nil {
@@ -83,6 +92,7 @@ func (l *Loop) Run(ctx context.Context) error {
 		return err
 	}
 	rs.StartedAt, rs.PID = l.Router.now(), os.Getpid()
+	rs.Features = []string{state.FeatureAsks} // waiting hooks send buttons only to a relay that routes their taps
 	l.logf("relay starting (pid %d, once=%v, offset %d)", rs.PID, l.Once, rs.Offset)
 	if l.Router.StartedAt.IsZero() {
 		l.Router.StartedAt = rs.StartedAt
@@ -143,12 +153,14 @@ func (l *Loop) Run(ctx context.Context) error {
 		if len(ups) > 0 {
 			_ = l.Store.SaveRelay(rs)
 		}
+		// Retire asks whose waiting hook died: no one else closes them.
+		l.Router.SweepAsks(ctx)
 		if draining && len(ups) < 100 {
 			draining = false
 		}
 		if !draining && skipped > 0 {
 			l.logf("skipped %d stale update(s)", skipped)
-			_, _ = l.Router.send(ctx, 0, fmt.Sprintf("skipped %d message(s) older than %d min while the relay was down", skipped, int(maxAge.Minutes())), nil)
+			_, _ = l.Router.send(ctx, 0, fmt.Sprintf("skipped %d message(s) older than %d min (the relay was down or the Mac slept)", skipped, int(maxAge.Minutes())), nil)
 			skipped = 0
 		}
 		if l.Once {

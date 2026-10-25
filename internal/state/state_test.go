@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -97,22 +98,38 @@ func TestSpoolOrder(t *testing.T) {
 	}
 }
 
+// The pace holds sends minGap apart, measured as it keeps them: between the
+// send times recorded at release. (Measured from after the first release
+// returned, which comes a moment after its record, the gap read up to that
+// moment short: 199.9 ms under -race.)
 func TestPaceEnforcesGap(t *testing.T) {
 	s := open(t)
 	gap := 200 * time.Millisecond
+	sent := func() time.Time {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(s.Dir, "send.last"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ns, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return time.Unix(0, ns)
+	}
 	rel, err := s.Pace(gap)
 	if err != nil {
 		t.Fatal(err)
 	}
 	rel()
-	start := time.Now()
+	first := sent()
 	rel2, err := s.Pace(gap)
 	if err != nil {
 		t.Fatal(err)
 	}
 	rel2()
-	if el := time.Since(start); el < gap {
-		t.Fatalf("second send after %v, want >= %v", el, gap)
+	if d := sent().Sub(first); d < gap {
+		t.Fatalf("second send %v after the first, want >= %v", d, gap)
 	}
 }
 

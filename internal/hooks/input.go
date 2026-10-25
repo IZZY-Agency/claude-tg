@@ -10,18 +10,21 @@ import (
 
 // Input is the subset of hook stdin JSON tg reads, across all events.
 type Input struct {
-	SessionID            string          `json:"session_id"`
-	Cwd                  string          `json:"cwd"`
-	HookEventName        string          `json:"hook_event_name"`
-	LastAssistantMessage string          `json:"last_assistant_message"`
-	StopHookActive       bool            `json:"stop_hook_active"`
-	Message              string          `json:"message"`
-	Title                string          `json:"title"`
-	NotificationType     string          `json:"notification_type"`
-	ToolName             string          `json:"tool_name"`
-	ToolInput            json.RawMessage `json:"tool_input"`
-	Error                string          `json:"error"`
-	ErrorDetails         string          `json:"error_details"`
+	SessionID             string          `json:"session_id"`
+	Cwd                   string          `json:"cwd"`
+	HookEventName         string          `json:"hook_event_name"`
+	LastAssistantMessage  string          `json:"last_assistant_message"`
+	StopHookActive        bool            `json:"stop_hook_active"`
+	Message               string          `json:"message"`
+	Title                 string          `json:"title"`
+	NotificationType      string          `json:"notification_type"`
+	ToolName              string          `json:"tool_name"`
+	ToolInput             json.RawMessage `json:"tool_input"`
+	TranscriptPath        string          `json:"transcript_path"`
+	PermissionSuggestions json.RawMessage `json:"permission_suggestions"`
+	Error                 string          `json:"error"`
+	ErrorDetails          string          `json:"error_details"`
+	AgentID               string          `json:"agent_id"` // set when the hook fires inside a subagent
 }
 
 // ParseInput decodes a hook payload; it rejects empty input and a missing session id.

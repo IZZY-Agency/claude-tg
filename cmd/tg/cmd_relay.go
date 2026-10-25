@@ -64,7 +64,7 @@ func cmdRelay(c *cli, args []string) int {
 	logf("%s", backendsLine("none (replies will be refused)"))
 	terminals := term.Mux{Backends: map[string]term.Terminal{agterm.Backend: &agterm.CLI{}, tmux.Backend: &tmux.CLI{}}}
 	router := &relay.Router{
-		API: a.client, Store: a.store, Term: terminals, ChatID: a.cfg.ChatID, UserID: a.cfg.UserID,
+		API: a.client, Store: a.store, Term: terminals, ChatID: a.cfg.ChatID, UserID: a.cfg.UserID, Secrets: []string{a.cfg.BotToken},
 		Agents: func(ctx context.Context) ([]session.Agent, error) { return session.ListAgents(ctx, a.cfg.ClaudePath) },
 		Log:    logf, StartedAt: time.Now(),
 	}

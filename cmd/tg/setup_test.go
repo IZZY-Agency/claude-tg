@@ -214,3 +214,49 @@ func TestRemoveBackupKeepsOriginalMode(t *testing.T) {
 		t.Fatalf("temp files left behind: %v", tmps)
 	}
 }
+
+func TestSetupCheckReportsOutdatedPermissionHook(t *testing.T) {
+	dir := isolate(t)
+	home := claudeHome(t)
+	bin := "/Users/alex/.local/bin/tg"
+	cfg := `{"bot_token":"1:x","chat_id":1,"binary_path":"` + bin + `"}`
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := `{"hooks":{"PermissionRequest":[{"hooks":[{"type":"command","command":"` + bin + ` hook permission-request","async":true}]}]}}`
+	if err := os.WriteFile(filepath.Join(home, "settings.json"), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if code := run([]string{"setup", "--check"}, strings.NewReader(""), &out, io.Discard); code != 0 {
+		t.Fatalf("code=%d out=%s", code, out.String())
+	}
+	if !strings.Contains(out.String(), "outdated: PermissionRequest") || strings.Contains(out.String(), "missing: PermissionRequest") {
+		t.Fatalf("output lacks the outdated line:\n%s", out.String())
+	}
+}
+
+func TestSetupCheckOutdatedLineHasNoDoubleSpace(t *testing.T) {
+	dir := isolate(t)
+	home := claudeHome(t)
+	bin := "/Users/alex/.local/bin/tg"
+	cfg := `{"bot_token":"1:x","chat_id":1,"binary_path":"` + bin + `"}`
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := `{"hooks":{"PermissionRequest":[{"hooks":[{"type":"command","command":"` + bin + ` hook permission-request","async":true}]}]}}`
+	if err := os.WriteFile(filepath.Join(home, "settings.json"), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	run([]string{"setup", "--check"}, strings.NewReader(""), &out, io.Discard)
+	if !strings.Contains(out.String(), "  outdated: PermissionRequest (run `tg setup` to update it)") {
+		t.Fatalf("outdated line malformed:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "  missing: Stop\n") {
+		t.Fatalf("missing line malformed:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "hooks: 0/6 installed") {
+		t.Fatalf("count wrong:\n%s", out.String())
+	}
+}

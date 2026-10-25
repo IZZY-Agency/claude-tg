@@ -4,7 +4,9 @@ package settings
 
 import (
 	"bytes"
+	"encoding/json"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -13,6 +15,23 @@ type HookSpec struct {
 	Event   string
 	Matcher string // "" means no matcher key
 	Command string
+	// Async installs the hook with "async": true. A hook Claude Code waits
+	// on (the permission wait) is synchronous and carries a Timeout instead.
+	Async bool
+	// Timeout is the hook's "timeout" in seconds; 0 omits the key.
+	Timeout int
+	// Replaces lists older hook kinds this spec supersedes. Install migrates
+	// such a hook in place instead of adding a second one.
+	Replaces []string
+}
+
+// permissionWaitTimeout is the PermissionRequest hook timeout: the 12 h wait
+// plus a margin.
+const permissionWaitTimeout = 43500
+
+// matchesKind reports whether kind is the spec's own kind or one it replaces.
+func (h HookSpec) matchesKind(kind string) bool {
+	return kind == h.Kind() || contains(h.Replaces, kind)
 }
 
 // Kind returns the `tg hook <kind>` suffix of the command.
@@ -27,12 +46,12 @@ func (h HookSpec) Kind() string {
 // DesiredHooks lists the six hook groups for the given binary path.
 func DesiredHooks(binary string) []HookSpec {
 	return []HookSpec{
-		{Event: "Stop", Command: HookCommand(binary, "stop")},
-		{Event: "PermissionRequest", Command: HookCommand(binary, "permission-request")},
-		{Event: "Notification", Matcher: "permission_prompt", Command: HookCommand(binary, "notification")},
-		{Event: "Notification", Matcher: "agent_needs_input", Command: HookCommand(binary, "notification")},
-		{Event: "StopFailure", Command: HookCommand(binary, "stop-failure")},
-		{Event: "SessionEnd", Command: HookCommand(binary, "session-end")},
+		{Event: "Stop", Command: HookCommand(binary, "stop"), Async: true},
+		{Event: "PermissionRequest", Command: HookCommand(binary, "permission-wait"), Timeout: permissionWaitTimeout, Replaces: []string{"permission-request"}},
+		{Event: "Notification", Matcher: "permission_prompt", Command: HookCommand(binary, "notification"), Async: true},
+		{Event: "Notification", Matcher: "agent_needs_input", Command: HookCommand(binary, "notification"), Async: true},
+		{Event: "StopFailure", Command: HookCommand(binary, "stop-failure"), Async: true},
+		{Event: "SessionEnd", Command: HookCommand(binary, "session-end"), Async: true},
 	}
 }
 
@@ -155,13 +174,50 @@ func newGroup(spec HookSpec) *Object {
 	h := newObject()
 	h.Set("type", "command")
 	h.Set("command", spec.Command)
-	h.Set("async", true)
+	if spec.Async {
+		h.Set("async", true)
+	}
+	if spec.Timeout > 0 {
+		h.Set("timeout", json.Number(strconv.Itoa(spec.Timeout)))
+	}
 	g := newObject()
 	if spec.Matcher != "" {
 		g.Set("matcher", spec.Matcher)
 	}
 	g.Set("hooks", []any{h})
 	return g
+}
+
+// conforms reports whether the hook object already carries the spec's
+// command and async flag, and its timeout when the spec sets one.
+func conforms(h *Object, spec HookSpec) bool {
+	if commandOf(h) != spec.Command {
+		return false
+	}
+	async, hasAsync := h.Get("async")
+	if spec.Async && async != true || !spec.Async && hasAsync {
+		return false
+	}
+	if spec.Timeout == 0 {
+		return true // a user's own timeout on an async hook is theirs
+	}
+	t, _ := h.Get("timeout")
+	n, isNum := t.(json.Number)
+	return isNum && n.String() == strconv.Itoa(spec.Timeout)
+}
+
+// conform rewrites the hook object to the spec: command, async flag, and the
+// timeout when the spec sets one.
+func conform(h *Object, spec HookSpec) {
+	h.Set("command", spec.Command)
+	if spec.Async {
+		h.Set("async", true)
+	} else {
+		h.Delete("async")
+	}
+	if spec.Timeout > 0 {
+		h.Set("timeout", json.Number(strconv.Itoa(spec.Timeout)))
+	}
 }
 
 // Install adds the desired hook groups and allow rules. A hook that already
@@ -178,30 +234,81 @@ func Install(src []byte, binary string, oldBinaries ...string) ([]byte, bool, er
 	changed = changed || created
 	for _, spec := range DesiredHooks(binary) {
 		groups, _ := arrayAt(hooks, spec.Event, true)
-		found := false
-		for _, g := range groups {
+		type cand struct {
+			gi   int
+			h    *Object
+			kind string
+		}
+		var cands []cand
+		for gi, g := range groups {
 			go_, ok := g.(*Object)
 			if !ok || groupMatcher(go_) != spec.Matcher {
 				continue
 			}
 			for _, h := range groupHooks(go_) {
 				hb, hk, ok := ParseHookCommand(commandOf(h))
-				if !ok || hk != spec.Kind() {
-					continue
-				}
-				if hb == binary {
-					found = true
-					break
-				}
-				if isStale(hb, oldBinaries) {
-					h.Set("command", spec.Command)
-					changed = true
-					found = true
-					break
+				if ok && spec.matchesKind(hk) && (hb == binary || isStale(hb, oldBinaries)) {
+					cands = append(cands, cand{gi, h, hk})
 				}
 			}
-			if found {
-				break
+		}
+		found := len(cands) > 0
+		if found {
+			// Keep the spec's own kind (conforming first), else the first
+			// replaced-kind hook; drop the other replaced-kind duplicates.
+			keep := 0
+			rank := func(c cand, h *Object) int {
+				switch {
+				case c.kind == spec.Kind() && conforms(h, spec):
+					return 0
+				case c.kind == spec.Kind():
+					return 1
+				}
+				return 2
+			}
+			for i, c := range cands {
+				if rank(c, c.h) < rank(cands[keep], cands[keep].h) {
+					keep = i
+				}
+			}
+			if !conforms(cands[keep].h, spec) {
+				conform(cands[keep].h, spec)
+				changed = true
+			}
+			drop := map[*Object]bool{}
+			for i, c := range cands {
+				if i != keep && c.kind != spec.Kind() {
+					drop[c.h] = true
+				}
+			}
+			if len(drop) > 0 {
+				var newGroups []any
+				for _, g := range groups {
+					go_, ok := g.(*Object)
+					if !ok {
+						newGroups = append(newGroups, g)
+						continue
+					}
+					var keptHooks []any
+					removed := false
+					for _, h := range groupHooks(go_) {
+						if drop[h] {
+							removed = true
+							continue
+						}
+						keptHooks = append(keptHooks, h)
+					}
+					if !removed {
+						newGroups = append(newGroups, g)
+						continue
+					}
+					if len(keptHooks) > 0 {
+						go_.Set("hooks", keptHooks)
+						newGroups = append(newGroups, go_)
+					}
+				}
+				hooks.Set(spec.Event, newGroups)
+				changed = true
 			}
 		}
 		if !found {
@@ -334,33 +441,44 @@ func Remove(src []byte, binaryPrefixes []string) ([]byte, bool, error) {
 	return out, changed, err
 }
 
-// Status reports which desired hooks and rules are present.
-func Status(src []byte, binary string) (installed, missing []HookSpec, missingRules []string, err error) {
+// Status reports which desired hooks and rules are present. A desired hook
+// that exists for this binary but carries an older kind or settings (for
+// example the async permission-request hook of v0.2.0) is listed in outdated,
+// not missing; `tg setup` migrates it in place.
+func Status(src []byte, binary string) (installed, missing, outdated []HookSpec, missingRules []string, err error) {
 	root, err := Parse(src)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	hooks, _ := objectAt(root, "hooks", false)
 	for _, spec := range DesiredHooks(binary) {
-		found := false
+		var current, stale bool
 		if hooks != nil {
-			if groups, ok := arrayAt(hooks, spec.Event, false); ok {
-				for _, g := range groups {
-					go_, isObj := g.(*Object)
-					if !isObj || groupMatcher(go_) != spec.Matcher {
+			groups, _ := arrayAt(hooks, spec.Event, false)
+			for _, g := range groups {
+				go_, isObj := g.(*Object)
+				if !isObj || groupMatcher(go_) != spec.Matcher {
+					continue
+				}
+				for _, h := range groupHooks(go_) {
+					hb, hk, ok := ParseHookCommand(commandOf(h))
+					if !ok || hb != binary || !spec.matchesKind(hk) {
 						continue
 					}
-					for _, h := range groupHooks(go_) {
-						if hb, hk, ok := ParseHookCommand(commandOf(h)); ok && hb == binary && hk == spec.Kind() {
-							found = true
-						}
+					if conforms(h, spec) {
+						current = true
+					} else {
+						stale = true
 					}
 				}
 			}
 		}
-		if found {
+		switch {
+		case current:
 			installed = append(installed, spec)
-		} else {
+		case stale:
+			outdated = append(outdated, spec)
+		default:
 			missing = append(missing, spec)
 		}
 	}
@@ -379,7 +497,7 @@ func Status(src []byte, binary string) (installed, missing []HookSpec, missingRu
 			missingRules = append(missingRules, rule)
 		}
 	}
-	return installed, missing, missingRules, nil
+	return installed, missing, outdated, missingRules, nil
 }
 
 func contains(list []string, s string) bool {

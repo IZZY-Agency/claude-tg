@@ -6,9 +6,14 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"time"
 )
+
+// FeatureAsks marks a relay that routes button taps and swipe-replies to
+// waiting hooks (see Ask).
+const FeatureAsks = "asks"
 
 // RelayState is what the relay persists between runs.
 type RelayState struct {
@@ -16,6 +21,10 @@ type RelayState struct {
 	StartedAt    time.Time `json:"started_at,omitempty"`
 	LastUpdateAt time.Time `json:"last_update_at,omitempty"`
 	PID          int       `json:"pid,omitempty"`
+	// Features the running relay handles, set when it starts. A relay from
+	// before a feature rewrites its state without it, so the list always
+	// describes the relay that started last.
+	Features []string `json:"features,omitempty"`
 }
 
 func (s *Store) relayPath() string { return filepath.Join(s.Dir, "relay.json") }
@@ -68,6 +77,16 @@ func (s *Store) RelayLocked() bool {
 	}
 	release()
 	return false
+}
+
+// RelayServes reports whether a relay runs (holds the lock) and lists
+// feature in its state.
+func (s *Store) RelayServes(feature string) bool {
+	if !s.RelayLocked() {
+		return false
+	}
+	rs, err := s.LoadRelay()
+	return err == nil && slices.Contains(rs.Features, feature)
 }
 
 type pending struct {

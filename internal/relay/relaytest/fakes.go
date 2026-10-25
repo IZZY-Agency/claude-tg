@@ -21,6 +21,7 @@ type Answer struct{ ID, Text string }
 type Edit struct {
 	MessageID int64
 	Text      string
+	Keyboard  [][]telegram.Button
 }
 
 // API records every Telegram call the router makes.
@@ -59,7 +60,19 @@ func (a *API) AnswerCallbackQuery(_ context.Context, id, text string) error {
 func (a *API) EditMessageText(_ context.Context, _ int64, messageID int64, text, _ string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.Edits = append(a.Edits, Edit{messageID, text})
+	a.Edits = append(a.Edits, Edit{MessageID: messageID, Text: text})
+	return nil
+}
+func (a *API) EditMessage(_ context.Context, _ int64, messageID int64, text, _ string, kb [][]telegram.Button) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.Edits = append(a.Edits, Edit{MessageID: messageID, Text: text, Keyboard: kb})
+	return nil
+}
+func (a *API) EditReplyMarkup(_ context.Context, _ int64, messageID int64, kb [][]telegram.Button) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.Edits = append(a.Edits, Edit{MessageID: messageID, Text: "", Keyboard: kb})
 	return nil
 }
 
@@ -94,6 +107,7 @@ type Term struct {
 	Typed         []Typed
 	OnType        func(id, text string)
 	ScreenCalls   int
+	ScreenLines   []int                                    // the lines asked of each Screen call, in order
 	NextScreen    func(call int, id string) (string, bool) // override for a given call number
 	DoubleNext    bool
 	MangleNext    bool
@@ -166,17 +180,25 @@ func (t *Term) Type(_ context.Context, p term.Pane, text string) error {
 }
 
 func hasPromptLine(screen string) bool {
-	for _, l := range strings.Split(screen, "\n") {
-		if strings.HasPrefix(l, "❯") {
-			return true
-		}
-	}
-	return false
+	return inputLine(strings.Split(screen, "\n")) >= 0
 }
 
-// render puts the input line into the screen.
+// inputLine is the index of the input prompt line: the last line starting
+// with "❯" that sits between the input box's borders, a line of "─" right
+// above and right below it. A prompt echoed in the transcript and a
+// picker's cursor line "❯ 1. …" at column 0 are not it; -1 when the screen
+// has none (a dialog or picker is up).
+func inputLine(lines []string) int {
+	for i := len(lines) - 2; i > 0; i-- {
+		if strings.HasPrefix(lines[i], "❯") && strings.HasPrefix(lines[i-1], "─") && strings.HasPrefix(lines[i+1], "─") {
+			return i
+		}
+	}
+	return -1
+}
+
+// render puts the input line into the screen, on the input prompt line.
 func (t *Term) render(id string) string {
-	lines := strings.Split(t.Screens[id], "\n")
 	shown := t.input[id]
 	if t.lagLeft > 0 {
 		t.lagLeft--
@@ -184,16 +206,16 @@ func (t *Term) render(id string) string {
 			shown = shown[:5]
 		}
 	}
-	for i, l := range lines {
-		if strings.HasPrefix(l, "❯") {
-			lines[i] = "❯ " + string(shown)
-			break
-		}
+	lines := strings.Split(t.Screens[id], "\n")
+	i := inputLine(lines)
+	if i < 0 {
+		return t.Screens[id]
 	}
+	lines[i] = "❯ " + string(shown)
 	return strings.Join(lines, "\n")
 }
 
-func (t *Term) Screen(_ context.Context, p term.Pane, _ int) (string, error) {
+func (t *Term) Screen(_ context.Context, p term.Pane, lines int) (string, error) {
 	t.notePane(p)
 	id := p.Target
 	if t.Missing[id] {
@@ -202,6 +224,7 @@ func (t *Term) Screen(_ context.Context, p term.Pane, _ int) (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.ScreenCalls++
+	t.ScreenLines = append(t.ScreenLines, lines)
 	if t.NextScreen != nil {
 		if s, ok := t.NextScreen(t.ScreenCalls, id); ok {
 			return s, nil

@@ -1,0 +1,25 @@
+❯ Use the WebFetch tool exactly once on this URL, character for character, and tell me the page     
+  title; do nothing else:                                                                           
+  https://example.org/sigcheck/segment01-segment02-segment03-segment04-segment05-segment06-segment0 
+  7-segment08-segment09-segment10-segment11-segment12-segment13-segment14-segment15-segment16-segme 
+  nt17-segment18-segment19-segment20-segment21-segment22-segment23-segment24-segment25?q=end        
+
+⏺ Fetch(https://example.org/sigcheck/segment01-segment02-segment03-segment04-segment05-segment06-seg
+       ment07-segment08-segment09-segment10-segment11-segment12-segment13-segment14-segment15-segmen
+       t16-segment17-segment18-segment19-segment20-segment21-segment22-segment23-segment24-segment25
+       ?q=end)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ Fetch
+ Claude wants to fetch content from example.org
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ url:
+ │ https://example.org/sigcheck/segment01-segment02-segment03-segment04-segment05-segment06-segment
+ │ 07-segment08-segment09-segment10-segment11-segment12-segment13-segment14-segment15-segment16-seg
+ │ ment17-segment18-segment19-segment20-segment21-segment22-segment23-segment24-segment25?q=end
+ prompt: What is the page title?
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to allow Claude to fetch this content?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for example.org
+   3. No, and tell Claude what to do differently (esc)

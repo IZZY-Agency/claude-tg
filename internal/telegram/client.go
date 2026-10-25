@@ -96,6 +96,19 @@ func (c *Client) call(ctx context.Context, method string, params any, out any) e
 	return ParseResponse(data, out)
 }
 
+// replyMarkup builds the inline_keyboard reply_markup for kb (never nil rows).
+func replyMarkup(kb [][]Button) map[string]any {
+	rows := make([][]map[string]any, 0, len(kb))
+	for _, row := range kb {
+		out := make([]map[string]any, 0, len(row))
+		for _, b := range row {
+			out = append(out, map[string]any{"text": b.Text, "callback_data": b.Data})
+		}
+		rows = append(rows, out)
+	}
+	return map[string]any{"inline_keyboard": rows}
+}
+
 // SendParams builds the sendMessage body for r.
 func SendParams(r SendRequest) map[string]any {
 	params := map[string]any{"chat_id": r.ChatID, "text": r.Text}
@@ -109,15 +122,7 @@ func SendParams(r SendRequest) map[string]any {
 		params["reply_parameters"] = map[string]any{"message_id": r.ReplyToMessageID, "allow_sending_without_reply": true}
 	}
 	if len(r.InlineKeyboard) > 0 {
-		rows := make([][]map[string]any, 0, len(r.InlineKeyboard))
-		for _, row := range r.InlineKeyboard {
-			out := make([]map[string]any, 0, len(row))
-			for _, b := range row {
-				out = append(out, map[string]any{"text": b.Text, "callback_data": b.Data})
-			}
-			rows = append(rows, out)
-		}
-		params["reply_markup"] = map[string]any{"inline_keyboard": rows}
+		params["reply_markup"] = replyMarkup(r.InlineKeyboard)
 	}
 	return params
 }
@@ -153,6 +158,25 @@ func (c *Client) EditMessageText(ctx context.Context, chatID, messageID int64, t
 		params["parse_mode"] = parseMode
 	}
 	return c.call(ctx, "editMessageText", params, nil)
+}
+
+// EditMessage replaces a bot message's text and sets its keyboard; a nil or
+// empty kb drops the keyboard.
+func (c *Client) EditMessage(ctx context.Context, chatID, messageID int64, text, parseMode string, kb [][]Button) error {
+	params := map[string]any{"chat_id": chatID, "message_id": messageID, "text": text}
+	if parseMode != "" {
+		params["parse_mode"] = parseMode
+	}
+	if len(kb) > 0 {
+		params["reply_markup"] = replyMarkup(kb)
+	}
+	return c.call(ctx, "editMessageText", params, nil)
+}
+
+// EditReplyMarkup replaces only a bot message's keyboard; an empty kb clears it.
+func (c *Client) EditReplyMarkup(ctx context.Context, chatID, messageID int64, kb [][]Button) error {
+	params := map[string]any{"chat_id": chatID, "message_id": messageID, "reply_markup": replyMarkup(kb)}
+	return c.call(ctx, "editMessageReplyMarkup", params, nil)
 }
 
 // SetMyCommands fills the bot's "/" menu.

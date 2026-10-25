@@ -220,12 +220,12 @@ func TestDetectIndent(t *testing.T) {
 }
 
 func TestStatusReportsMissing(t *testing.T) {
-	installed, missing, missingRules, err := Status(fixture(t), bin)
+	installed, missing, _, missingRules, err := Status(fixture(t), bin)
 	if err != nil || len(installed) != 0 || len(missing) != 6 || len(missingRules) != 4 {
 		t.Fatalf("installed=%d missing=%d rules=%d err=%v", len(installed), len(missing), len(missingRules), err)
 	}
 	out, _, _ := Install(fixture(t), bin)
-	installed, missing, missingRules, _ = Status(out, bin)
+	installed, missing, _, missingRules, _ = Status(out, bin)
 	if len(installed) != 6 || len(missing) != 0 || len(missingRules) != 0 {
 		t.Fatalf("after install: installed=%d missing=%d rules=%d", len(installed), len(missing), len(missingRules))
 	}
@@ -294,7 +294,7 @@ func TestBinaryPathWithSpacesIsQuoted(t *testing.T) {
 	if !strings.Contains(string(out), `'/Users/x/My Tools/tg' hook stop`) {
 		t.Fatalf("command not quoted:\n%s", out)
 	}
-	installed, missing, _, _ := Status(out, spaced)
+	installed, missing, _, _, _ := Status(out, spaced)
 	if len(installed) != 6 || len(missing) != 0 {
 		t.Fatalf("status installed=%d missing=%d", len(installed), len(missing))
 	}
@@ -309,5 +309,217 @@ func TestBinaryPathWithSpacesIsQuoted(t *testing.T) {
 	moved, changed, _ := Install(out, "/Users/x/bin/tg", spaced)
 	if !changed || strings.Contains(string(moved), "My Tools") {
 		t.Fatalf("stale quoted path not replaced:\n%s", moved)
+	}
+}
+
+// v0.2.0 installed every hook async, PermissionRequest included, and ran
+// `hook permission-request`.
+const v020Settings = `{
+  "hooks": {
+    "PermissionRequest": [
+      {"hooks": [{"type": "command", "command": "/usr/bin/my-gate"}]},
+      {"hooks": [{"type": "command", "command": "/Users/alex/.local/bin/tg hook permission-request", "async": true}]}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "/Users/alex/.local/bin/tg hook stop", "async": true}]}
+    ]
+  }
+}
+`
+
+func permissionHooks(t *testing.T, out []byte) []map[string]any {
+	t.Helper()
+	var hs []map[string]any
+	for _, g := range hookGroups(view(t, out), "PermissionRequest") {
+		for _, h := range g.(map[string]any)["hooks"].([]any) {
+			hs = append(hs, h.(map[string]any))
+		}
+	}
+	return hs
+}
+
+func TestInstallFreshPermissionWait(t *testing.T) {
+	out, _, err := Install(fixture(t), bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tgHooks []map[string]any
+	for _, h := range permissionHooks(t, out) {
+		if strings.HasPrefix(h["command"].(string), bin+" hook ") {
+			tgHooks = append(tgHooks, h)
+		}
+	}
+	if len(tgHooks) != 1 {
+		t.Fatalf("tg PermissionRequest hooks = %d", len(tgHooks))
+	}
+	h := tgHooks[0]
+	if _, has := h["async"]; has {
+		t.Fatalf("async key present: %v", h)
+	}
+	if h["timeout"] != float64(43500) {
+		t.Fatalf("timeout = %v", h["timeout"])
+	}
+	if !strings.HasSuffix(h["command"].(string), " hook permission-wait") {
+		t.Fatalf("command = %v", h["command"])
+	}
+	// Every other tg hook stays async with no timeout.
+	for _, ev := range []string{"Stop", "Notification", "StopFailure", "SessionEnd"} {
+		for _, g := range hookGroups(view(t, out), ev) {
+			for _, h := range g.(map[string]any)["hooks"].([]any) {
+				hm := h.(map[string]any)
+				if !strings.HasPrefix(hm["command"].(string), bin+" hook ") {
+					continue
+				}
+				if hm["async"] != true || hm["timeout"] != nil {
+					t.Fatalf("%s hook: %v", ev, hm)
+				}
+			}
+		}
+	}
+}
+
+func TestInstallMigratesAsyncPermissionRequest(t *testing.T) {
+	out, changed, err := Install([]byte(v020Settings), bin)
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	hs := permissionHooks(t, out)
+	if len(hs) != 2 {
+		t.Fatalf("PermissionRequest hooks = %d, want 2 (user's + tg's): %v", len(hs), hs)
+	}
+	if hs[0]["command"] != "/usr/bin/my-gate" {
+		t.Fatalf("user hook touched: %v", hs[0])
+	}
+	h := hs[1]
+	if h["command"] != bin+" hook permission-wait" || h["timeout"] != float64(43500) {
+		t.Fatalf("not migrated: %v", h)
+	}
+	if _, has := h["async"]; has {
+		t.Fatalf("async not removed: %v", h)
+	}
+	if n := len(hookGroups(view(t, out), "PermissionRequest")); n != 2 {
+		t.Fatalf("groups = %d, want 2", n)
+	}
+	again, changed, err := Install(out, bin)
+	if err != nil || changed || !bytes.Equal(again, out) {
+		t.Fatalf("second install not idempotent: changed=%v err=%v", changed, err)
+	}
+}
+
+func TestStatusOldPermissionHookIsMissing(t *testing.T) {
+	_, missing, outdated, _, err := Status([]byte(v020Settings), bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, m := range outdated {
+		if m.Event == "PermissionRequest" {
+			found = true
+		}
+	}
+	for _, m := range missing {
+		if m.Event == "PermissionRequest" {
+			t.Fatalf("outdated hook also listed missing: %v", missing)
+		}
+	}
+	if !found {
+		t.Fatalf("v0.2.0 PermissionRequest hook not reported outdated; outdated=%v", outdated)
+	}
+	out, _, _ := Install([]byte(v020Settings), bin)
+	_, missing, outdated, _, _ = Status(out, bin)
+	for _, m := range append(missing, outdated...) {
+		if m.Event == "PermissionRequest" {
+			t.Fatal("migrated hook still missing or outdated")
+		}
+	}
+}
+
+func TestRemoveDropsPermissionWait(t *testing.T) {
+	out, _, _ := Install([]byte(v020Settings), bin)
+	out, changed, err := Remove(out, []string{bin})
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	for _, h := range permissionHooks(t, out) {
+		if strings.Contains(h["command"].(string), "permission-wait") {
+			t.Fatalf("permission-wait left behind: %v", h)
+		}
+	}
+	if hs := permissionHooks(t, out); len(hs) != 1 || hs[0]["command"] != "/usr/bin/my-gate" {
+		t.Fatalf("user hook lost: %v", hs)
+	}
+}
+
+func TestInstallLeavesUserTimeoutOnAsyncHooks(t *testing.T) {
+	src := `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"` + bin + ` hook stop","async":true,"timeout":30}]}]}}`
+	out, _, err := Install([]byte(src), bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := hookGroups(view(t, out), "Stop")
+	if len(g) != 1 {
+		t.Fatalf("Stop groups = %d", len(g))
+	}
+	h := g[0].(map[string]any)["hooks"].([]any)[0].(map[string]any)
+	if h["timeout"] != float64(30) {
+		t.Fatalf("user timeout changed: %v", h)
+	}
+	installed, _, outdated, _, _ := Status([]byte(src), bin)
+	if len(outdated) != 0 {
+		t.Fatalf("outdated = %v", outdated)
+	}
+	has := false
+	for _, s := range installed {
+		has = has || s.Event == "Stop"
+	}
+	if !has {
+		t.Fatalf("Stop with user timeout not counted installed: %v", installed)
+	}
+}
+
+func TestInstallDropsExtraReplacedKind(t *testing.T) {
+	src := `{"hooks":{"PermissionRequest":[
+	  {"hooks":[{"type":"command","command":"` + bin + ` hook permission-request","async":true}]},
+	  {"hooks":[{"type":"command","command":"` + bin + ` hook permission-wait","timeout":43500}]},
+	  {"hooks":[{"type":"command","command":"/usr/bin/my-gate"}]}
+	]}}`
+	out, changed, err := Install([]byte(src), bin)
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	var cmds []string
+	for _, h := range permissionHooks(t, out) {
+		cmds = append(cmds, h["command"].(string))
+	}
+	want := []string{bin + " hook permission-wait", "/usr/bin/my-gate"}
+	if strings.Join(cmds, "|") != strings.Join(want, "|") {
+		t.Fatalf("commands = %v, want %v", cmds, want)
+	}
+	if n := len(hookGroups(view(t, out), "PermissionRequest")); n != 2 {
+		t.Fatalf("groups = %d, want 2 (emptied group dropped)", n)
+	}
+	again, changed, _ := Install(out, bin)
+	if changed || !bytes.Equal(again, out) {
+		t.Fatal("not idempotent")
+	}
+}
+
+func TestInstallMigratesOldBinaryPermissionRequest(t *testing.T) {
+	const old = "/opt/old/claude-tg"
+	src := `{"hooks":{"PermissionRequest":[{"hooks":[{"type":"command","command":"` + old + ` hook permission-request","async":true}]}]}}`
+	out, changed, err := Install([]byte(src), bin, old)
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	hs := permissionHooks(t, out)
+	if len(hs) != 1 {
+		t.Fatalf("hooks = %v", hs)
+	}
+	h := hs[0]
+	if h["command"] != bin+" hook permission-wait" || h["timeout"] != float64(43500) {
+		t.Fatalf("not migrated: %v", h)
+	}
+	if _, has := h["async"]; has {
+		t.Fatalf("async kept: %v", h)
 	}
 }

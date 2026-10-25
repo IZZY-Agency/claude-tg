@@ -284,3 +284,133 @@ func TestDeliverStopsWhenContextDone(t *testing.T) {
 		t.Fatalf("err=%v elapsed=%v", err, time.Since(start))
 	}
 }
+
+func TestSendButtonsRecordsMessageID(t *testing.T) {
+	rec := &sendtest.Recorder{}
+	s := newSender(t, rec)
+	kb := [][]telegram.Button{{{Text: "Yes", Data: "a:1"}, {Text: "No", Data: "a:2"}}}
+	id, err := s.SendButtons(context.Background(), "sid", "<b>ask</b>", "ask", kb)
+	if err != nil || id != 1 {
+		t.Fatalf("id=%d err=%v", id, err)
+	}
+	req := rec.Calls[0]
+	if req.ParseMode != "HTML" || req.Text != "<b>ask</b>" || req.Silent || len(req.InlineKeyboard) != 1 || req.InlineKeyboard[0][1].Data != "a:2" {
+		t.Fatalf("request: %+v", req)
+	}
+	sess, err := s.Store.LoadSession("sid")
+	if err != nil || len(sess.LastMessageIDs) != 1 || sess.LastMessageIDs[0] != 1 {
+		t.Fatalf("session=%+v err=%v", sess, err)
+	}
+	// It is also known as a prompt's message, after its ask is gone: a
+	// reply to it then never reaches another prompt. A plain message is not.
+	if !sess.AskMessage(1) {
+		t.Fatalf("the button message is not recorded as a prompt's: %+v", sess)
+	}
+	if _, err := s.Send(context.Background(), Message{SessionID: "sid", Label: "acme", Body: "done"}); err != nil {
+		t.Fatal(err)
+	}
+	sess, _ = s.Store.LoadSession("sid")
+	if len(sess.LastMessageIDs) != 2 || sess.AskMessage(sess.LastMessageIDs[1]) {
+		t.Fatalf("session=%+v", sess)
+	}
+}
+
+func TestSendButtonsNeverSpools(t *testing.T) {
+	rec := &sendtest.Recorder{Script: []error{&telegram.NetError{Err: &net.DNSError{Err: "no such host", Name: "api.telegram.org"}}}}
+	s := newSender(t, rec)
+	id, err := s.SendButtons(context.Background(), "sid", "<b>ask</b>", "ask", [][]telegram.Button{{{Text: "Yes", Data: "a:1"}}})
+	if err == nil || id != 0 || errors.Is(err, ErrSpooled) {
+		t.Fatalf("id=%d err=%v", id, err)
+	}
+	if items, _ := s.Store.SpoolList(); len(items) != 0 {
+		t.Fatalf("spool=%+v", items)
+	}
+}
+
+func TestSendButtonsPlainFallbackKeepsKeyboard(t *testing.T) {
+	rec := &sendtest.Recorder{Script: []error{&telegram.APIError{Code: 400, Description: "Bad Request: can't parse entities"}}}
+	s := newSender(t, rec)
+	kb := [][]telegram.Button{{{Text: "Yes", Data: "a:1"}}, {{Text: "No", Data: "a:2"}}}
+	if _, err := s.SendButtons(context.Background(), "sid", "<b>ask</b>", "ask", kb); err != nil || len(rec.Calls) != 2 {
+		t.Fatalf("err=%v calls=%d", err, len(rec.Calls))
+	}
+	second := rec.Calls[1]
+	if second.ParseMode != "" || second.Text != "ask" || fmt.Sprint(second.InlineKeyboard) != fmt.Sprint(kb) {
+		t.Fatalf("fallback request: %+v", second)
+	}
+}
+
+func TestSendButtonsRedactsButtonText(t *testing.T) {
+	rec := &sendtest.Recorder{}
+	s := newSender(t, rec)
+	s.Secrets = []string{"hunter2hunter2"}
+	kb := [][]telegram.Button{{{Text: "run token=abcdefgh12345 hunter2hunter2", Data: "token=abcdefgh12345"}}}
+	if _, err := s.SendButtons(context.Background(), "sid", "<b>token=abcdefgh12345</b>", "hunter2hunter2 token=abcdefgh12345", kb); err != nil {
+		t.Fatal(err)
+	}
+	req := rec.Calls[0]
+	b := req.InlineKeyboard[0][0]
+	if strings.Contains(b.Text, "abcdefgh12345") || strings.Contains(b.Text, "hunter2") || strings.Contains(req.Text, "abcdefgh12345") {
+		t.Fatalf("not redacted: %+v", req)
+	}
+	if b.Data != "token=abcdefgh12345" {
+		t.Fatalf("data changed: %q", b.Data)
+	}
+}
+
+// Clean (plain and button texts) and CleanHTML (HTML) are exactly what
+// SendButtons applies, so a caller can store and later edit the text that
+// was really sent.
+func TestCleanMatchesSendButtons(t *testing.T) {
+	rec := &sendtest.Recorder{}
+	s := newSender(t, rec)
+	s.Secrets = []string{"123456:ABCDEFsecretbot"}
+	html := "<b>bot123456:ABCDEFsecretbot token=abcdefgh12345</b>"
+	if got := s.CleanHTML(html); got != "<b>bot[redacted] token=[redacted]</b>" {
+		t.Fatalf("CleanHTML=%q", got)
+	}
+	plain := "bot123456:ABCDEFsecretbot mysql --password=s3cr3t<dump.sql"
+	if got := s.Clean(plain); got != "bot[redacted] mysql --password=[redacted]" {
+		t.Fatalf("Clean=%q", got)
+	}
+	kb := [][]telegram.Button{{{Text: "123456:ABCDEFsecretbot", Data: "a:1"}}}
+	if _, err := s.SendButtons(context.Background(), "sid", html, plain, kb); err != nil {
+		t.Fatal(err)
+	}
+	if req := rec.Calls[0]; req.Text != s.CleanHTML(html) || req.InlineKeyboard[0][0].Text != s.Clean("123456:ABCDEFsecretbot") {
+		t.Fatalf("request: %+v", req)
+	}
+}
+
+// When Telegram refuses the HTML, the plain text that goes instead is
+// cleaned too.
+func TestSendButtonsPlainFallbackIsRedacted(t *testing.T) {
+	rec := &sendtest.Recorder{Script: []error{&telegram.APIError{Code: 400, Description: "Bad Request: can't parse entities"}}}
+	s := newSender(t, rec)
+	s.Secrets = []string{"123456:ABCDEFsecretbot"}
+	plain := "curl bot123456:ABCDEFsecretbot -u password=s3cr3t<dump.sql"
+	if _, err := s.SendButtons(context.Background(), "sid", "<b>ask</b>", plain, [][]telegram.Button{{{Text: "Yes", Data: "a:1"}}}); err != nil || len(rec.Calls) != 2 {
+		t.Fatalf("err=%v calls=%d", err, len(rec.Calls))
+	}
+	if got := rec.Calls[1]; got.ParseMode != "" || got.Text != "curl bot[redacted] -u password=[redacted]" {
+		t.Fatalf("fallback request: %+v", got)
+	}
+}
+
+// Buttons delivered hours late would mislead: throttling that outlasts the
+// retries is an error for the caller, never a spooled message.
+func TestSendButtonsExhausted429NeverSpools(t *testing.T) {
+	e := &telegram.APIError{Code: 429, RetryAfter: 1}
+	rec := &sendtest.Recorder{Script: []error{e, e, e}}
+	s := newSender(t, rec)
+	id, err := s.SendButtons(context.Background(), "sid", "<b>ask</b>", "ask", [][]telegram.Button{{{Text: "Yes", Data: "a:1"}}})
+	if err == nil || id != 0 || errors.Is(err, ErrSpooled) || len(rec.Calls) != 3 {
+		t.Fatalf("id=%d err=%v calls=%d", id, err, len(rec.Calls))
+	}
+	if items, _ := s.Store.SpoolList(); len(items) != 0 {
+		t.Fatalf("spool=%+v", items)
+	}
+	if sess, _ := s.Store.LoadSession("sid"); len(sess.LastMessageIDs) != 0 {
+		t.Fatalf("an unsent message was recorded: %v", sess.LastMessageIDs)
+	}
+}

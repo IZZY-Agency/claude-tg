@@ -1,0 +1,12 @@
+❯ Use the AskUserQuestion tool right now, with exactly one single-choice question: question "Which fruit do you want for the picker probe?", header "Fruit", options  
+  Apple (description "A crisp red apple"), Banana (description "A ripe yellow banana"), Cherry (description "A handful of cherries"). Do nothing else.                
+
+⏺ User declined to answer questions
+  ⎿  · Which fruit do you want for the picker probe? (Apple / Banana / Cherry)
+
+✻ Worked for 2s · done 6:59 PM
+  
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← 1 agent                                                                                                  ◐ medium · /effort

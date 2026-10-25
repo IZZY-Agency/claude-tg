@@ -76,14 +76,16 @@ func TestTruncateAppendsLine(t *testing.T) {
 
 func TestRedact(t *testing.T) {
 	cases := map[string]string{
-		"ghp_abcdefghijklmnopqrstuvwxyz0123":         "[redacted]",
-		"glpat-abcdefghijklmnopqrst":                 "[redacted]",
-		"sk-abcdefghijklmnopqrstuvwxyz":              "[redacted]",
-		"xoxb-1234567890-abcdefghij":                 "[redacted]",
-		"AKIAABCDEFGHIJKLMNOP":                       "[redacted]",
-		"token=supersecretvalue123":                  "token=[redacted]",
-		"PASSWORD=hunter2hunter2":                    "PASSWORD=[redacted]",
-		"token=abc":                                  "token=abc",
+		"ghp_abcdefghijklmnopqrstuvwxyz0123": "[redacted]",
+		"glpat-abcdefghijklmnopqrst":         "[redacted]",
+		"sk-abcdefghijklmnopqrstuvwxyz":      "[redacted]",
+		"xoxb-1234567890-abcdefghij":         "[redacted]",
+		"AKIAABCDEFGHIJKLMNOP":               "[redacted]",
+		"token=supersecretvalue123":          "token=[redacted]",
+		"PASSWORD=hunter2hunter2":            "PASSWORD=[redacted]",
+		"token=abc":                          "token=abc",
+		// Raw text: the whole value goes, "<" included (Ruling R23).
+		"mysql --password=s3cr3t<dump.sql":           "mysql --password=[redacted]",
 		"deploy ok, see https://git.example.com/x/1": "deploy ok, see https://git.example.com/x/1",
 	}
 	for in, want := range cases {
@@ -244,5 +246,34 @@ func TestEmphasisLeavesLinkHrefAlone(t *testing.T) {
 	want := `<a href="https://example.com/_index_">doc</a> and <i>it</i>`
 	if got != want {
 		t.Fatalf("got %q\nwant %q", got, want)
+	}
+}
+
+// RedactHTML runs on finished HTML: it masks the text between tags and
+// never swallows a tag.
+func TestRedactHTMLKeepsTags(t *testing.T) {
+	cases := map[string]string{
+		"<b>key=abcdefgh123</b>": "<b>key=[redacted]</b>",
+		"🔐 <b>key=abcdefgh12</b>\n\n<i>→ password=hunter2hunter2</i> sk-0123456789abcdefXYZ": "🔐 <b>key=[redacted]</b>\n\n<i>→ password=[redacted]</i> [redacted]",
+		"<code>Bash: mysql --password=s3cr3t&lt;dump.sql</code>":                             "<code>Bash: mysql --password=[redacted]</code>",
+		"no tags token=supersecretvalue123":                                                  "no tags token=[redacted]",
+		"<pre>ok</pre>":                                                                      "<pre>ok</pre>",
+	}
+	for in, want := range cases {
+		if got := RedactHTML(in); got != want {
+			t.Errorf("RedactHTML(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// Plain Redact on the same HTML would eat the closing tag.
+	if got := Redact("<b>key=abcdefgh123</b>"); got != "<b>key=[redacted]" {
+		t.Errorf("Redact on HTML = %q", got)
+	}
+}
+
+// StripHTML is the plain-text form of tg's HTML for a fallback edit.
+func TestStripHTML(t *testing.T) {
+	in := "🔐 <b>a&lt;b&gt;&amp;</b>\nneeds permission: <code>Bash: echo '&lt;x&gt;'</code>\n\n<i>→ ok</i>"
+	if got, want := StripHTML(in), "🔐 a<b>&\nneeds permission: Bash: echo '<x>'\n\n→ ok"; got != want {
+		t.Fatalf("StripHTML = %q, want %q", got, want)
 	}
 }

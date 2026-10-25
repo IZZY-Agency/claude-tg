@@ -1,0 +1,18 @@
+❯ Use the AskUserQuestion tool right now, with exactly one single-choice question: question "Which fruit do you want for the picker probe?", header "Fruit", options  
+  Apple (description "A crisp red apple"), Banana (description "A ripe yellow banana"), Cherry (description "A handful of cherries"). Do nothing else.                
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Fruit 
+
+Which fruit do you want for the picker probe?
+
+  1. Apple
+     A crisp red apple
+❯ 2. Banana
+     A ripe yellow banana
+  3. Cherry
+     A handful of cherries
+  4. Type something.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

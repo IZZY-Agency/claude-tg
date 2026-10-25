@@ -9,7 +9,7 @@
 
 ## What it does
 
-`tg` is a small command-line tool for a Mac or a Linux machine that runs Claude Code. It posts messages from your Claude Code sessions to a private Telegram bot chat on your phone: an alert when a session waits on a permission prompt or stops on an API error, every answer of a session you chose to follow, and messages Claude sends because it decided something is worth telling you. With the relay installed you can answer from the phone: your text is typed into the right session, and you can approve or deny a permission prompt. `tg setup` installs everything into Claude Code at user scope: a skill, six hooks and four allow rules. `tg remove` takes it out again.
+`tg` is a small command-line tool for a Mac or a Linux machine that runs Claude Code. It posts messages from your Claude Code sessions to a private Telegram bot chat on your phone: an alert when a session waits on a permission prompt or stops on an API error, every answer of a session you chose to follow, and messages Claude sends because it decided something is worth telling you. With the relay installed you can answer from the phone: your text is typed into the right session, and you can answer a question or a permission prompt with one tap on a button. `tg setup` installs everything into Claude Code at user scope: a skill, six hooks and four allow rules. `tg remove` takes it out again.
 
 [Releases](https://github.com/IZZY-Agency/claude-tg/releases) ·
 [Issues](https://github.com/IZZY-Agency/claude-tg/issues)
@@ -20,7 +20,7 @@
 - Or Linux, x86_64 or arm64, with these limits: the relay runs as a systemd user service; tmux is the only terminal backend; the away gate relies on logind's idle hint, which desktop environments set. Where no desktop session exists (ssh, tty, containers) or `loginctl` is missing, every alert is delivered; set `away_after_seconds` to `0` in `~/.config/claude-tg/config.json` to force that anywhere.
 - Claude Code installed, with the `claude` command on PATH. `tg` runs `claude agents --json` to learn session names.
 - A Telegram account on your phone.
-- Only for replies from the phone: the Claude session must run inside agterm (macOS) or tmux (3.1 or newer). Nothing else needs either tool.
+- Only for replies and buttons on the phone: the Claude session must run inside agterm (macOS) or tmux (3.1 or newer), and the relay must be installed (`tg relay install`). Nothing else needs either tool.
 
 ## 1. Create your bot
 
@@ -99,6 +99,8 @@ Non-interactive: `tg setup --yes --token <t> --chat-id <id>`. `--chat-id` is you
 
 Restart Claude sessions that were already open when setup ran. They keep their old hook snapshot until then; only sessions started after setup have the hooks.
 
+**Upgrading from 0.2.0.** Run `tg setup`: it moves the `PermissionRequest` hook to the new synchronous `permission-wait` hook. Run `tg relay install` to reload the relay with the new binary; a relay from 0.2.0 that is still running does not take button taps, so until you reload it every prompt gets the plain 🔐 alert. Then restart Claude sessions that were already open; they keep the old hook until you do, and send the plain 🔐 alert without buttons. `tg setup --check` reports an old hook as outdated; it does not check the relay, so run `tg relay install` yourself.
+
 ## What reaches the phone
 
 | Icon | When | Sound |
@@ -106,8 +108,8 @@ Restart Claude sessions that were already open when setup ran. They keep their o
 | 🔔 | `tg send "..."` (default level): a Claude decided something is critical, or you asked to be pinged | yes |
 | 📋 | `tg send --level info "..."`: routine lines from a monitoring loop | silent |
 | 💬 | follow mode: every final answer of a followed session, split into up to 4 parts | silent |
-| 🔐 | a session has waited ~6 s on a permission prompt, naming the tool and command | yes |
-| ✋ | a background agent needs input | yes |
+| 🔐 | a session waits on a permission prompt, naming the tool and command. Where buttons are possible (see Questions and permission prompts) it carries buttons and arrives once you count as away. Otherwise (no relay, a session opened before the upgrade, a prompt that gets no buttons) it is the plain alert, about 6 s after the prompt | yes |
+| ✋ | a session asks you a question, with one button per option (where buttons are possible); also a background agent that needs input, as a plain alert | yes |
 | 💥 | a session stopped on an API error (rate limit, auth, billing) | yes |
 | ⚙️ | follow on/off confirmations, test messages | silent |
 
@@ -118,7 +120,10 @@ tables in monospace.
 
 Hook-generated alerts (🔐 ✋ 💥) are sent only when you have been away from
 the machine for `away_after_seconds` (default 120; `0` disables the gate) and
-the same alert was not sent in the last 10 minutes. macOS reports the idle
+the same alert was not sent in the last 10 minutes. Questions and permission
+prompts with buttons: each one is its own message and is never deduplicated. A dialog
+that opens while you are at the machine reaches the phone once you have been
+idle for `away_after_seconds`. macOS reports the idle
 time itself; on Linux it comes from logind's idle hint (see Requirements).
 Your own `tg send` calls and the follow feed are never held back.
 
@@ -180,20 +185,74 @@ leading space, so a leading digit can never pick a dialog option), a second
 look at the screen, then Enter. If a permission dialog appeared in between,
 Enter is withheld and you are told to resend. Newlines become spaces, 4000
 characters max. When the session is in the middle of a turn the text is queued
-and you are told so. A session waiting on a permission prompt refuses plain
-text: use `/approve` (types `1`) or `/deny` (sends Esc), by reply or with
-`@name`; the dialog is read twice and must be the same both times.
+and you are told so.
+
+### Questions and permission prompts
+
+When a session asks a question or waits on a permission prompt and you have
+been away for `away_after_seconds`, the phone gets a message with buttons.
+One tap answers it. The dialog stays live on the Mac, and whichever side
+answers first wins. The phone message then says what happened: `answered at
+the Mac` (you answered, or pressed Esc), `session ended` (Claude was quit), or
+`expired: answer at the Mac` after 12 hours. If you answered on the phone but
+the answer could not reach Claude, the message says `not delivered: answer at
+the Mac`.
+
+- **Question.** One message per question, one button per option. Tap an option
+  to answer. Tap **✍️ Other**, then reply to the message with your own text.
+  For a multi-select question, tap options to tick them, then tap **Done**.
+  A swipe-reply with text to a question message answers it as well. A call
+  with several questions sends one message each, and Claude gets the answers
+  once every question has one.
+- **Permission prompt.** **✅ Yes** and **❌ No**. If Claude Code offers to
+  allow the command or a folder for good or for the session, the message lists
+  each choice in full, numbered, and a short button (`① Yes, always`, `② Yes,
+  this session`) carries the same number. The "switch to auto mode" choice is
+  not offered. **❌ No** stops Claude, like Esc at the Mac. Reply to the message
+  with text to deny the prompt and send your text to Claude, so it can adjust.
+
+Buttons need all of this: the relay from this version is running, the session
+runs in agterm or tmux, and the hook can read that pane and finds the dialog of
+its own call on it within 3 seconds. The hook reads the pane again while the
+message is out to see the dialog close at the Mac. Buttons come for questions
+and for Bash, Read, Edit, Write and WebFetch prompts.
+These keep the plain alert, with no buttons: other tools' prompts (MCP tools
+among them), plan approval, prompts raised inside a subagent, a session in
+another terminal, a dialog whose text tg cannot match to the call (a very long
+command, a dialog queued behind another), a question call whose questions
+share one text, the sandbox network-request prompt and background agents. Non-interactive runs (`claude -p`, the Agent SDK) have no
+dialog, so nothing is sent for them. tg does not cover MCP elicitation
+dialogs: they get no alert at all.
+
+While a session has a question or permission prompt open, text sent to it is
+never typed. Once its buttons are on the phone, you get a pointer to them.
+Before that, you are told they will arrive shortly, or to answer at the Mac. A
+dialog on the pane that has no buttons (a plan approval, a question picker, any
+prompt without them) is refused with "answer it on the Mac"; only beside the
+plain Bash dialog does the refusal offer `/approve` and `/deny`.
+
+`/approve` and `/deny` decide a prompt that has buttons on the phone like its
+✅ Yes and ❌ No, and type nothing: as a reply to the prompt's message, exactly
+that prompt (one no longer open is refused); with `@name`, or for the single
+followed session, the newest when several wait (the reply names which). On a
+question they point you to its buttons. When the session has no prompt on the
+phone, they type into the plain "Do you want to proceed?" dialog of a Bash or
+Read prompt, and only there: `1` for `/approve`, Esc for `/deny`, after two
+reads of the screen that show the same dialog. Anything else (an Edit, Write
+or WebFetch dialog without buttons, a plan approval, a question picker) is
+answered at the Mac.
 
 After a reply or an approval from the phone, that session's next answer comes
 back to the phone even when it is not followed (two answers when it was busy).
 
-Commands: `/sessions`, `/follow name`, `/unfollow name`, `/approve`, `/deny`,
-`/status`, `/help`. Feedback: 👍 delivered, 👌 approved, 👎 denied (Telegram
-allows a fixed set of reaction emojis), otherwise a reply with the reason. Only
-your Telegram id in your chat is honoured; everyone else is dropped silently.
-Each update is acknowledged before it is acted on, so a crash never replays a
-keystroke. Messages older than 10 minutes while the startup backlog drains are
-skipped with one notice.
+Commands: `/sessions`, `/follow name`, `/unfollow name`, `/approve` and
+`/deny`, `/status`, `/help`. Feedback: 👍 delivered, 👌 approved, 👎
+denied (Telegram allows a fixed set of reaction emojis), otherwise a reply
+with the reason. Only your Telegram id in your chat is honoured; everyone else
+is dropped silently. Each update is acknowledged before it is acted on, so a
+crash never replays a keystroke. Messages older than 10 minutes (the
+startup backlog, or what piled up while the Mac slept) are skipped with one
+notice; button taps are never skipped.
 
 ### Running Claude in tmux
 
@@ -232,7 +291,7 @@ Two messages mean the relay could not type:
   - the session name at the top of every message (the name Claude Code shows, or `<folder>-<first 6 characters of the session id>` when it cannot be resolved);
   - the final answer text of a followed session, and the next answer of a session after you replied to it or approved a prompt from the phone;
   - the title and body Claude passes to `tg send`;
-  - for a permission alert: the tool name and a one-line summary, which is the command for `Bash`, the file path for `Edit`, `Write`, `Read`, `MultiEdit` and `NotebookEdit`, and the raw tool input for other tools, cut to 120 characters;
+  - for a question: its header, the question text, its options with their descriptions and previews, and the answer you gave; for a permission alert: the tool name and a one-line summary, which is the command for `Bash`, the file path for `Edit`, `Write`, `Read`, `MultiEdit` and `NotebookEdit`, and the raw tool input for other tools, cut to 120 characters; with buttons, also the allow rules and folders Claude Code offers to remember, and the text of a denial you typed;
   - for a stopped session: the error and its details as Claude Code reported them;
   - for a background agent that needs input: the notification text;
   - on `/sessions` from the phone: session names, busy or idle, follow state, and the last folder name of each session's working directory;

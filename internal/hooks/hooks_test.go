@@ -279,3 +279,54 @@ func TestStopSendsPendingAnswersThenStops(t *testing.T) {
 		t.Fatalf("counter not cleared: %+v", s)
 	}
 }
+
+// A waiting hook owns the dialog: the 🔐 alert would duplicate its buttons.
+func TestNotificationSkippedWhileAskOpen(t *testing.T) {
+	h := newHarness(t)
+	if err := Handle(context.Background(), "permission-request", load(t, "permission_request_bash.json"), h.deps); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.PutAsk(&state.Ask{ID: state.NewAskID(), SessionID: sid, Tool: "Bash", HookPID: 4242, Created: h.now}); err != nil {
+		t.Fatal(err)
+	}
+	h.deps.Alive = func(pid int) bool { return true }
+	if err := Handle(context.Background(), "notification", load(t, "notification_permission.json"), h.deps); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.rec.Calls) != 0 {
+		t.Fatalf("alert sent while a waiting hook handles the dialog: %+v", h.rec.Calls)
+	}
+}
+
+func TestNotificationStillSentWithoutAsk(t *testing.T) {
+	cases := map[string]func(h *harness){
+		"no ask": func(h *harness) {},
+		"another session's ask": func(h *harness) {
+			_ = h.store.PutAsk(&state.Ask{ID: state.NewAskID(), SessionID: "other", Tool: "Bash", Created: h.now})
+		},
+		"closed ask": func(h *harness) {
+			_ = h.store.PutAsk(&state.Ask{ID: state.NewAskID(), SessionID: sid, Tool: "Bash", Created: h.now, Closed: "mac"})
+		},
+		// A waiting hook stuck on an earlier dialog must not silence a newer one.
+		"ask older than the pending request": func(h *harness) {
+			_ = h.store.PutAsk(&state.Ask{ID: state.NewAskID(), SessionID: sid, Tool: "Bash", Created: h.now.Add(-time.Minute)})
+			_ = Handle(context.Background(), "permission-request", load(t, "permission_request_bash.json"), h.deps)
+		},
+		"ask of a dead hook": func(h *harness) {
+			_ = h.store.PutAsk(&state.Ask{ID: state.NewAskID(), SessionID: sid, Tool: "Bash", HookPID: 4242, Created: h.now})
+			h.deps.Alive = func(pid int) bool { return pid != 4242 }
+		},
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			setup(h)
+			if err := Handle(context.Background(), "notification", load(t, "notification_permission.json"), h.deps); err != nil {
+				t.Fatal(err)
+			}
+			if len(h.rec.Calls) != 1 || !strings.HasPrefix(h.rec.Calls[0].Text, "🔐 <b>acme-shop-92</b>") {
+				t.Fatalf("calls=%+v", h.rec.Calls)
+			}
+		})
+	}
+}

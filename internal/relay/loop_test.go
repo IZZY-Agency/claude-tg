@@ -4,18 +4,31 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/IZZY-Agency/claude-tg/internal/ask"
+	"github.com/IZZY-Agency/claude-tg/internal/state"
 	"github.com/IZZY-Agency/claude-tg/internal/telegram"
 )
 
 type fakePoller struct {
+	mu      sync.Mutex
 	batches [][]telegram.Update
 	calls   []int64 // offsets requested
 }
 
+// polls is how many times the loop has polled; safe while it runs.
+func (p *fakePoller) polls() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.calls)
+}
+
 func (p *fakePoller) GetUpdates(_ context.Context, offset int64, _ int) ([]telegram.Update, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.calls = append(p.calls, offset)
 	if len(p.batches) == 0 {
 		return nil, nil
@@ -31,9 +44,11 @@ func TestPartitionStale(t *testing.T) {
 		{UpdateID: 1, Message: &telegram.Message{Date: now.Add(-time.Hour).Unix()}},
 		{UpdateID: 2, Message: &telegram.Message{Date: now.Add(-5 * time.Minute).Unix()}},
 		{UpdateID: 3, CallbackQuery: &telegram.CallbackQuery{Message: &telegram.Message{Date: now.Add(-20 * time.Minute).Unix()}}},
+		// An ask tap carries only its message's date, not when it was tapped.
+		{UpdateID: 4, CallbackQuery: &telegram.CallbackQuery{Data: "a:0123456789abcdef:0:y", Message: &telegram.Message{Date: now.Add(-20 * time.Minute).Unix()}}},
 	}
 	fresh, stale := PartitionStale(ups, now, 10*time.Minute)
-	if len(fresh) != 1 || fresh[0].UpdateID != 2 || len(stale) != 2 {
+	if len(fresh) != 2 || fresh[0].UpdateID != 2 || fresh[1].UpdateID != 4 || len(stale) != 2 {
 		t.Fatalf("fresh=%+v stale=%+v", fresh, stale)
 	}
 }
@@ -55,7 +70,7 @@ func TestRunOnceSkipsStaleAndAdvancesOffset(t *testing.T) {
 	f.typedOnce(t, "A1", " fresh one\n")
 	skipped := false
 	for _, s := range f.api.Sent {
-		if strings.Contains(s.Text, "skipped 2") {
+		if s.Text == "skipped 2 message(s) older than 10 min (the relay was down or the Mac slept)" {
 			skipped = true
 		}
 	}
@@ -159,7 +174,7 @@ func TestStaleFilteredAcrossStartupBatches(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	// Stop after the second batch: the poller then returns nothing and we cancel.
 	go func() {
-		for len(p.calls) < 3 {
+		for p.polls() < 3 {
 			time.Sleep(10 * time.Millisecond)
 		}
 		cancel()
@@ -214,5 +229,109 @@ func TestAgentPathIsWhatThePlistUses(t *testing.T) {
 	}
 	if !strings.Contains(Plist("/Users/x/.local/bin/tg", "/Users/x/.local/state/claude-tg", "/Users/x", nil), "<string>"+want+"</string>") {
 		t.Fatal("plist PATH differs from AgentPath")
+	}
+}
+
+// runPolls runs the loop until it has polled n times, then stops it.
+func runPolls(t *testing.T, l *Loop, p *fakePoller, n int) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // also when Run fails: the watcher below must stop
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for p.polls() < n && ctx.Err() == nil {
+			time.Sleep(5 * time.Millisecond)
+		}
+		cancel()
+	}()
+	err := l.Run(ctx)
+	cancel()
+	<-done
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func skippedNotices(f *fixture) int {
+	n := 0
+	for _, m := range f.api.Sent {
+		if strings.Contains(m.Text, "skipped") {
+			n++
+		}
+	}
+	return n
+}
+
+// Telegram dates a callback by its message: a tap on a 30-minute-old ask
+// message is a fresh tap, in steady state too.
+func TestRunHonoursOldAskTapInSteadyState(t *testing.T) {
+	f := newFixture(t)
+	f.putAsk(t, permAsk(askP, sidShop, "acme-shop-92", 700))
+	tap := tapUpdate(ask.TapData(askP, 0, 'y', 0), 700)
+	tap.UpdateID, tap.CallbackQuery.Message.Date = 2, f.now.Add(-30*time.Minute).Unix()
+	p := &fakePoller{batches: [][]telegram.Update{{}, {tap}}} // the empty batch ends the startup drain
+	l := &Loop{Poll: p, Router: f.r, Store: f.store, MaxAge: 10 * time.Minute, Log: func(string, ...any) {}}
+	runPolls(t, l, p, 3)
+	a := f.loadAsk(t, askP)
+	if !a.Done || a.Decision == nil || a.Decision.Behavior != "allow" {
+		t.Fatalf("tap not honoured: %+v", a)
+	}
+	if got := f.toasts(); len(got) != 1 || got[0] != "approved" {
+		t.Fatalf("toasts = %q", got)
+	}
+	if n := skippedNotices(f); n != 0 {
+		t.Fatalf("the tap was reported as skipped: %+v", f.api.Sent)
+	}
+}
+
+// A relay that kept running while the Mac slept must not type hours-old
+// text after wake: past the drain, old messages and old session picks are
+// still skipped.
+func TestRunSkipsOldMessageInSteadyState(t *testing.T) {
+	f := newFixture(t)
+	old := f.msg("ship it", 101)
+	old.UpdateID, old.Message.Date = 2, f.now.Add(-30*time.Minute).Unix()
+	pick := tapUpdate("s:"+sidShop+":deadbeef", 1001)
+	pick.UpdateID, pick.CallbackQuery.Message.Date = 3, f.now.Add(-30*time.Minute).Unix()
+	p := &fakePoller{batches: [][]telegram.Update{{}, {old, pick}}}
+	l := &Loop{Poll: p, Router: f.r, Store: f.store, MaxAge: 10 * time.Minute, Log: func(string, ...any) {}}
+	runPolls(t, l, p, 3)
+	if len(f.term.Typed) != 0 || len(f.api.Answers) != 0 || len(f.api.Reactions) != 0 {
+		t.Fatalf("an old update was handled: typed = %+v answers = %+v", f.term.Typed, f.api.Answers)
+	}
+	if n := skippedNotices(f); n != 1 || !strings.Contains(f.api.LastText(), "skipped 2 message") {
+		t.Fatalf("want one notice for both old updates: %+v", f.api.Sent)
+	}
+}
+
+// While the startup backlog drains, an old message is still skipped, but an
+// ask tap is honoured: the ask itself says whether it still waits.
+func TestRunHonoursAskTapInStartupDrain(t *testing.T) {
+	f := newFixture(t)
+	f.putAsk(t, permAsk(askP, sidShop, "acme-shop-92", 700))
+	old := f.msg("ship it", 101)
+	old.UpdateID, old.Message.Date = 7, f.now.Add(-time.Hour).Unix()
+	tap := tapUpdate(ask.TapData(askP, 0, 'n', 0), 700)
+	tap.UpdateID, tap.CallbackQuery.Message.Date = 8, f.now.Add(-time.Hour).Unix()
+	closed := permAsk(askP2, sidShop, "acme-shop-92", 720)
+	closed.Closed = "mac"
+	f.putAsk(t, closed)
+	late := tapUpdate(ask.TapData(askP2, 0, 'y', 0), 720)
+	late.UpdateID, late.CallbackQuery.Message.Date = 9, f.now.Add(-time.Hour).Unix()
+	p := &fakePoller{batches: [][]telegram.Update{{old, tap, late}}}
+	l := &Loop{Poll: p, Router: f.r, Store: f.store, Once: true, MaxAge: 10 * time.Minute, Log: func(string, ...any) {}}
+	if err := l.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.term.Typed) != 0 {
+		t.Fatalf("the stale message was typed: %+v", f.term.Typed)
+	}
+	sameDecision(t, f.loadAsk(t, askP).Decision, state.Decision{Behavior: "deny", Suggestion: -1, Message: ask.NoMessage, Interrupt: true})
+	if got := f.toasts(); len(got) != 2 || got[0] != "denied" || got[1] != "already answered at the Mac" {
+		t.Fatalf("toasts = %q", got)
+	}
+	if n := skippedNotices(f); n != 1 || !strings.Contains(f.api.LastText(), "skipped 1 message") {
+		t.Fatalf("want one notice for the one stale message: %+v", f.api.Sent)
 	}
 }

@@ -1,0 +1,18 @@
+  (each with a one-word description). Do nothing else.                                                                                                                
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Colours  ☐ Pet  ✔ Submit  →
+
+Which colours do you like for the probe?
+
+❯ 1. [✔] Red
+         Warm
+  2. [ ] Green
+         Natural
+  3. [ ] Blue
+         Calm
+  4. [ ] Type something
+     Next
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel

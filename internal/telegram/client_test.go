@@ -1,7 +1,12 @@
 package telegram
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -103,5 +108,87 @@ func TestSendParamsInlineKeyboard(t *testing.T) {
 	}
 	if _, has := SendParams(SendRequest{ChatID: 1, Text: "x"})["reply_markup"]; has {
 		t.Fatal("reply_markup must be absent without a keyboard")
+	}
+}
+
+// editServer records the method path and JSON body of the one call it receives.
+func editServer(t *testing.T) (*Client, *string, *map[string]any) {
+	t.Helper()
+	var path string
+	body := map[string]any{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		b, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(b, &body); err != nil {
+			t.Errorf("body: %v", err)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	t.Cleanup(srv.Close)
+	return &Client{Token: "T", HTTP: srv.Client(), BaseURL: srv.URL}, &path, &body
+}
+
+func TestEditMessageSendsKeyboard(t *testing.T) {
+	c, path, body := editServer(t)
+	kb := [][]Button{{{Text: "Yes", Data: "a:x"}}}
+	if err := c.EditMessage(context.Background(), 1, 7, "hi", "HTML", kb); err != nil {
+		t.Fatal(err)
+	}
+	if *path != "/botT/editMessageText" {
+		t.Fatalf("path=%q", *path)
+	}
+	rm := (*body)["reply_markup"].(map[string]any)
+	btn := rm["inline_keyboard"].([]any)[0].([]any)[0].(map[string]any)
+	if btn["callback_data"] != "a:x" || btn["text"] != "Yes" {
+		t.Fatalf("button: %+v", btn)
+	}
+	if (*body)["parse_mode"] != "HTML" || (*body)["text"] != "hi" {
+		t.Fatalf("body: %+v", *body)
+	}
+}
+
+func TestEditMessageWithoutKeyboardOmitsMarkup(t *testing.T) {
+	c, _, body := editServer(t)
+	if err := c.EditMessage(context.Background(), 1, 7, "hi", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, has := (*body)["reply_markup"]; has {
+		t.Fatalf("reply_markup must be absent: %+v", *body)
+	}
+}
+
+func TestEditReplyMarkupEmptyClearsKeyboard(t *testing.T) {
+	c, path, body := editServer(t)
+	if err := c.EditReplyMarkup(context.Background(), 1, 7, nil); err != nil {
+		t.Fatal(err)
+	}
+	if *path != "/botT/editMessageReplyMarkup" {
+		t.Fatalf("path=%q", *path)
+	}
+	got, _ := json.Marshal((*body)["reply_markup"])
+	if string(got) != `{"inline_keyboard":[]}` {
+		t.Fatalf("reply_markup=%s", got)
+	}
+}
+
+func TestEditReplyMarkupSendsKeyboard(t *testing.T) {
+	c, path, body := editServer(t)
+	kb := [][]Button{{{Text: "✓ Red", Data: "a:x:1:o0"}}, {{Text: "Done", Data: "a:x:1:d"}, {Text: "✍️ Other", Data: "a:x:1:x"}}}
+	if err := c.EditReplyMarkup(context.Background(), 1, 7, kb); err != nil {
+		t.Fatal(err)
+	}
+	if *path != "/botT/editMessageReplyMarkup" {
+		t.Fatalf("path=%q", *path)
+	}
+	got, _ := json.Marshal((*body)["reply_markup"])
+	want := `{"inline_keyboard":[[{"callback_data":"a:x:1:o0","text":"✓ Red"}],[{"callback_data":"a:x:1:d","text":"Done"},{"callback_data":"a:x:1:x","text":"✍️ Other"}]]}`
+	if string(got) != want {
+		t.Fatalf("reply_markup=%s\nwant %s", got, want)
+	}
+	if (*body)["chat_id"] != float64(1) || (*body)["message_id"] != float64(7) {
+		t.Fatalf("body: %+v", *body)
+	}
+	if _, has := (*body)["text"]; has {
+		t.Fatalf("a keyboard edit must not send text: %+v", *body)
 	}
 }
