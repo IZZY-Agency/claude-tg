@@ -1100,6 +1100,7 @@ func TestWaitCancelledClosesUnderABusyLock(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	free, done := make(chan struct{}), make(chan struct{})
+	var signalled time.Time
 	w.onSleep = func() {
 		if w.sleeps != 1 {
 			return
@@ -1125,15 +1126,15 @@ func TestWaitCancelledClosesUnderABusyLock(t *testing.T) {
 		}()
 		<-held
 		w.mac = true // Esc at the Mac: its result is in the transcript
+		signalled = time.Now()
 		cancel()
 	}
-	start := time.Now()
 	out := waitPermission(ctx, load(t, "permission_request_bash.json"), w.deps)
-	took := time.Since(start)
+	took := time.Since(signalled)
 	close(free)
 	<-done
 	if out != nil || took > 1500*time.Millisecond {
-		t.Fatalf("out=%s after %s, want no decision within the 1.5s grace", out, took)
+		t.Fatalf("out=%s, closed %s after the signal, want no decision within the 1.5s grace", out, took)
 	}
 	a, err := w.store.LoadAsk(w.id(t))
 	if err != nil || a.Closed != "mac" || !a.TakeBack {
@@ -1157,6 +1158,7 @@ func TestWaitCancelledUnderABusySessionLock(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	free, done := make(chan struct{}), make(chan struct{})
+	var signalled time.Time
 	w.onSleep = func() {
 		if w.sleeps != 1 {
 			return
@@ -1181,15 +1183,15 @@ func TestWaitCancelledUnderABusySessionLock(t *testing.T) {
 		}()
 		<-held
 		w.mac = true
+		signalled = time.Now()
 		cancel()
 	}
-	start := time.Now()
 	out := waitPermission(ctx, load(t, "permission_request_bash.json"), w.deps)
-	took := time.Since(start)
+	took := time.Since(signalled)
 	close(free)
 	<-done
 	if out != nil || took > 1500*time.Millisecond {
-		t.Fatalf("out=%s after %s, want no decision within the 1.5s grace", out, took)
+		t.Fatalf("out=%s, closed %s after the signal, want no decision within the 1.5s grace", out, took)
 	}
 	a, err := w.store.LoadAsk(w.id(t))
 	if err != nil || a.Closed != "mac" || !a.TakeBack {
