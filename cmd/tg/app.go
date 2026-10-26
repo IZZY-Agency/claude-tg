@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/IZZY-Agency/claude-tg/internal/agterm"
 	"github.com/IZZY-Agency/claude-tg/internal/config"
 	"github.com/IZZY-Agency/claude-tg/internal/send"
 	"github.com/IZZY-Agency/claude-tg/internal/session"
@@ -72,14 +73,20 @@ func newApp(c *cli) (*app, int) {
 	client := telegram.New(cfg.BotToken)
 	a := &app{
 		cfg: cfg, cfgPath: path, store: store, client: client,
-		sender: &send.Sender{API: client, Store: store, ChatID: cfg.ChatID, MinGap: minGap, Log: store.Logf, Secrets: []string{cfg.BotToken}},
+		sender: &send.Sender{API: client, Store: store, ChatID: cfg.ChatID, MinGap: minGap, Log: store.Logf, Secrets: cfg.Secrets()},
 		env:    session.FromEnv(c.env, cwd),
 	}
 	return a, exitOK
 }
 
 func (a *app) resolve(ctx context.Context, env session.Env) (*state.Session, error) {
-	return session.Resolve(ctx, a.store, a.cfg.ClaudePath, env)
+	return session.Resolve(ctx, a.store, a.cfg.ClaudePath, env, session.Options{Tab: agtermTab, Clean: a.sender.Clean})
+}
+
+// agtermTab is session.TabFunc through agtermctl.
+func agtermTab(ctx context.Context, agtermID string) (string, bool, error) {
+	t, ok, err := (&agterm.CLI{}).Tab(ctx, agtermID)
+	return t.Name, ok, err
 }
 
 // envFor is the env to resolve sid with: the process's own facts for its own

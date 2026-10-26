@@ -89,6 +89,10 @@ func Unit(binary, stateDir, home string, extra map[string]string) (string, error
 	b.WriteString("[Unit]\nDescription=claude-tg Telegram relay\n\n[Service]\n")
 	fmt.Fprintf(&b, "ExecStart=%s\n", execCommand(binary, "relay"))
 	b.WriteString("Restart=always\nRestartSec=10\n")
+	// A stop signals the relay alone, which then ends its voice command's
+	// process group itself; signalled together, the command could die
+	// first and its failure reach the phone.
+	b.WriteString("KillMode=mixed\n")
 	// Environment= resolves specifiers but gives $ no meaning (systemd.exec(5)).
 	fmt.Fprintf(&b, "Environment=%s\n", unitWord("PATH="+AgentPath(home)))
 	fmt.Fprintf(&b, "Environment=%s\n", unitWord("HOME="+home))

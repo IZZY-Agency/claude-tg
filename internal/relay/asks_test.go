@@ -373,7 +373,7 @@ func TestAtNameRefusedWhileAskOpen(t *testing.T) {
 	// While the hook still waits for the owner to be away nothing was sent,
 	// but the picker is open at the Mac: typing would land in it.
 	a := permAsk(askP, sidShop, "acme-shop-92", 0)
-	a.MessageIDs, a.Texts = nil, nil
+	a.MessageIDs, a.Texts, a.Signature = nil, nil, state.Fingerprint("dialog")
 	f.putAsk(t, a)
 	f.handle(t, f.msg("@acme-shop-92 run the tests", 0))
 	if len(f.term.Typed) != 0 || f.api.LastText() != askUnsentRefusal {
@@ -777,6 +777,21 @@ func TestAskHelpAndCommandsOfferButtonsFirst(t *testing.T) {
 			t.Fatalf("help lacks %q", want)
 		}
 	}
+	for _, want := range []string{
+		"While you are away from the Mac, or the session is working on something you sent from the phone, a session's question or permission prompt comes here with buttons.",
+		"Plan approval and subagent prompts have no buttons: answer them at the Mac.",
+	} {
+		if !strings.Contains(helpText, want) {
+			t.Fatalf("help lacks %q", want)
+		}
+	}
+	// MCP prompts get buttons: no line saying what has none names them.
+	// The fallback line names them as dialogs /approve types into.
+	for _, line := range strings.Split(helpText, "\n") {
+		if strings.Contains(line, "MCP") && (strings.Contains(line, "no buttons") || !strings.Contains(line, "/approve")) {
+			t.Fatalf("help still says MCP prompts have no buttons: %q", line)
+		}
+	}
 	for _, c := range Commands {
 		if (c.Command == "approve" || c.Command == "deny") && !strings.Contains(c.Description, "fallback") {
 			t.Fatalf("/%s: %q", c.Command, c.Description)
@@ -940,6 +955,10 @@ func TestEditsFallBackToPlainText(t *testing.T) {
 		t.Fatalf("sweep edits = %+v", f.api.Edits)
 	}
 
+	// An expired parked text gets its pick's edit (a missing one only a toast).
+	if err := f.store.PutPending("deadbeef", state.Parked{Text: "please rerun", MessageID: 500, Created: f.now.Add(-pendingTTL - time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
 	f.handle(t, tapUpdate("s:"+sidShop+":deadbeef", 1001))
 	if len(f.api.Edits) != 3 || f.api.Edits[2].MessageID != 1001 || f.api.Edits[2].Text != "expired; send the text again" {
 		t.Fatalf("pick edits = %+v", f.api.Edits)
@@ -1692,9 +1711,65 @@ func TestSweepTakesBackTheAnswerOwed(t *testing.T) {
 	}
 }
 
+// An ask answered from the phone whose hook went without collecting the
+// answer (its stdout write failed, or it wrote the answer and could not
+// record that) is retired by the sweep, which drops its voice mark first,
+// so no later answer is spoken for it, and keeps its credit: the answer
+// may well have reached Claude, and its text is still owed to the phone.
+// Other credits and marks stay. When dropping the mark fails, the ask is
+// kept, unedited, for the next sweep.
+func TestSweepDropsTheMarkOfAnUncollectedAnswer(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into a read-only directory")
+	}
+	f := newFixture(t)
+	f.r.Alive = func(int) bool { return false }
+	later := f.now.Add(time.Minute)
+	if _, err := f.store.UpdateSession(sidShop, func(s *state.Session) {
+		s.ArmAsk(askP)
+		s.MarkVoice(askP, "", f.now)
+		s.ArmAsk(askP2)
+		s.MarkVoice("", "", later)
+		s.PendingAnswers = 1
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a := permAsk(askP, sidShop, "acme-shop-92", 700)
+	a.Done, a.Decision, a.Armed = true, &state.Decision{Behavior: "allow", Suggestion: -1}, true
+	f.putAsk(t, a)
+
+	dir := filepath.Join(f.store.Dir, "sessions")
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	f.r.SweepAsks(context.Background())
+	_ = os.Chmod(dir, 0o700)
+	if f.loadAsk(t, askP).ID != askP || len(f.api.Edits) != 0 {
+		t.Fatalf("edits = %+v, want the ask kept as it was for the next sweep", f.api.Edits)
+	}
+
+	f.r.SweepAsks(context.Background())
+	f.askGone(t, askP)
+	if len(f.api.Edits) != 1 || !strings.HasSuffix(f.api.Edits[0].Text, "<i>not delivered: answer at the Mac</i>") {
+		t.Fatalf("edits = %+v", f.api.Edits)
+	}
+	s, err := f.store.LoadSession(sidShop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(s.AskCredits, []string{askP, askP2}) || s.PendingAnswers != 1 {
+		t.Fatalf("credits = %q pending = %d, want every credit kept", s.AskCredits, s.PendingAnswers)
+	}
+	if m := s.VoiceMarks; len(m) != 1 || m[0].AskID != "" || !m[0].At.Equal(later) {
+		t.Fatalf("marks = %+v, want only the uncollected ask's mark gone", m)
+	}
+}
+
 // stopHook runs the session's Stop hook (hooks.Handle "stop") as Claude
-// Code does after an answer, and reports whether it sent that answer to
-// the phone.
+// Code does after an answer, on the fixture's clock (the marks the relay
+// made at f.now are live), and reports whether it sent that answer to the
+// phone.
 func (f *fixture) stopHook(t *testing.T, sessionID string) bool {
 	t.Helper()
 	rec := &sendtest.Recorder{}
@@ -1704,6 +1779,7 @@ func (f *fixture) stopHook(t *testing.T, sessionID string) bool {
 		Resolve: func(_ context.Context, env session.Env) (*state.Session, error) {
 			return f.store.LoadSession(env.SessionID)
 		},
+		Now: func() time.Time { return f.now },
 	}
 	in := &hooks.Input{SessionID: sessionID, HookEventName: "Stop", LastAssistantMessage: "done: 3 files changed"}
 	if err := hooks.Handle(context.Background(), "stop", in, d); err != nil {
@@ -1745,5 +1821,203 @@ func TestTakingBackAnAnswerLeavesLaterOnes(t *testing.T) {
 	}
 	if f.stopHook(t, sidShop) {
 		t.Fatal("a third Stop sent: one credit was counted twice")
+	}
+}
+
+// A voice answer taken back takes back only its own mark: an older
+// transcript marks the session, then ask A is answered by voice from the
+// phone and the Mac wins anyway. The session's next Stop spends A's
+// credit and the oldest mark, the transcript's, so A's mark is left (marks
+// are spent apart from credits). A transcript and a voice answer to
+// prompt B then mark the session; taking A back, by the sweep's retire
+// (the hook could not in time) or by the hook's own give-back, drops A's
+// mark and leaves the later marks and B's credit alone. The Stop hook
+// runs on the fixture's clock, so no mark has lapsed.
+func TestTakingBackAVoiceAnswerLeavesLaterMarks(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		retire bool // the sweep's retire takes A back; else the hook does
+	}{
+		{"retire", true},
+		{"hook give-back", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newVoiceFixture(t, &transcriber{text: "use pnpm instead"})
+			older := f.now.Add(-time.Minute)
+			if _, err := f.store.UpdateSession(sidShop, func(s *state.Session) { s.MarkVoice("", "", older) }); err != nil {
+				t.Fatal(err)
+			}
+			a := permAsk(askP, sidShop, "acme-shop-92", 700)
+			a.HookPID = 999999
+			f.putAsk(t, a)
+			hookA := true
+			f.r.Alive = func(pid int) bool { return pid != 999999 || hookA }
+			answeredA := f.voiceAnswer(t, 700)
+			if m := f.marks(t, sidShop); len(m) != 2 || m[1].AskID != askP || !m[1].At.Equal(answeredA) {
+				t.Fatalf("marks = %+v, want the older transcript's and A's", m)
+			}
+			if _, err := f.store.UpdateAsk(askP, func(a *state.Ask) error {
+				a.Closed, a.TakeBack = "mac", c.retire // the Mac won
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if !f.stopHook(t, sidShop) {
+				t.Fatal("the Stop after A did not send")
+			}
+			f.markedOnce(t, sidShop, askP, answeredA) // the older mark was spent
+			f.now = f.now.Add(time.Minute)
+			delivered := f.voiceAnswer(t, 101) // a transcript for acme-shop-92
+			f.typedOnce(t, "A1", " use pnpm instead\n")
+			f.putAsk(t, permAsk(askP2, sidShop, "acme-shop-92", 720))
+			f.now = f.now.Add(time.Minute)
+			answered := f.voiceAnswer(t, 720)
+			if m := f.marks(t, sidShop); len(m) != 3 || m[0].AskID != askP {
+				t.Fatalf("marks before the take-back = %+v, want A's still first", m)
+			}
+			if c.retire {
+				hookA = false // A's hook is gone
+				f.r.SweepAsks(context.Background())
+				f.askGone(t, askP)
+			} else if err := f.store.TakeBackAnswer(context.Background(), sidShop, askP); err != nil {
+				t.Fatal(err)
+			}
+			s, err := f.store.LoadSession(sidShop)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if m := s.VoiceMarks; len(m) != 2 || m[0].AskID != "" || !m[0].At.Equal(delivered) || m[1].AskID != askP2 || !m[1].At.Equal(answered) {
+				t.Fatalf("marks = %+v, want the transcript's at %v and B's at %v", m, delivered, answered)
+			}
+			if !slices.Equal(s.AskCredits, []string{askP2}) {
+				t.Fatalf("credits = %q, want B's", s.AskCredits)
+			}
+		})
+	}
+}
+
+// voiceAnswer confirms a voice note replying to message replyTo with ✅
+// Send, and returns the time the Send was handled at.
+func (f *fixture) voiceAnswer(t *testing.T, replyTo int64) time.Time {
+	t.Helper()
+	k, id := f.confirm(t, f.voice(7, replyTo))
+	at := f.now
+	f.handle(t, tapUpdate("v:"+k+":y", id))
+	return at
+}
+
+// A voice reply marks the session when it completes an ask, with the ask's
+// id, so that taking the ask's answer back takes the mark too: a permission
+// prompt, which it completes at once, also in a followed session, which
+// gets no credit. A typed reply to the same prompt marks nothing. A voice
+// reply to one question of two marks nothing while the other is open, nor
+// when buttons then answer the other; one answering the last open question
+// marks.
+func TestVoiceAnswerAskMarks(t *testing.T) {
+	t.Run("permission prompt", func(t *testing.T) {
+		f := newVoiceFixture(t, &transcriber{text: "use pnpm instead"})
+		f.putAsk(t, permAsk(askP, sidShop, "acme-shop-92", 700))
+		at := f.voiceAnswer(t, 700)
+		if a := f.loadAsk(t, askP); !a.Done || !a.Armed || f.pending(t, sidShop) != 1 {
+			t.Fatalf("done=%v armed=%v pending=%d", a.Done, a.Armed, f.pending(t, sidShop))
+		}
+		f.markedOnce(t, sidShop, askP, at)
+		if m := f.marks(t, sidShop); m[0].Lang != "en" {
+			t.Fatalf("mark %+v, want the reply's language, en", m[0])
+		}
+	})
+	t.Run("followed session", func(t *testing.T) {
+		f := newVoiceFixture(t, &transcriber{text: "use pnpm instead"})
+		f.putAsk(t, permAsk(askP2, sidBlog, "blog-6a", 720))
+		at := f.voiceAnswer(t, 720)
+		if a := f.loadAsk(t, askP2); !a.Done || a.Armed || f.pending(t, sidBlog) != 0 {
+			t.Fatalf("done=%v armed=%v pending=%d", a.Done, a.Armed, f.pending(t, sidBlog))
+		}
+		f.markedOnce(t, sidBlog, askP2, at)
+	})
+	t.Run("typed reply", func(t *testing.T) {
+		f := newFixture(t)
+		f.putAsk(t, permAsk(askP, sidShop, "acme-shop-92", 700))
+		f.handle(t, f.msg("use pnpm instead", 700))
+		if a := f.loadAsk(t, askP); !a.Done || f.pending(t, sidShop) != 1 || len(f.marks(t, sidShop)) != 0 {
+			t.Fatalf("done=%v pending=%d marks=%+v", a.Done, f.pending(t, sidShop), f.marks(t, sidShop))
+		}
+	})
+	t.Run("one question of two, then buttons", func(t *testing.T) {
+		f := newVoiceFixture(t, &transcriber{text: "Mango"})
+		f.putAsk(t, questionAsk(t, 710, 711))
+		f.voiceAnswer(t, 710)
+		if a := f.loadAsk(t, askQ); answerOf(t, a, 0) != "Mango" || a.Done || len(f.marks(t, sidShop)) != 0 {
+			t.Fatalf("answers=%s done=%v marks=%+v", a.Answers, a.Done, f.marks(t, sidShop))
+		}
+		f.handle(t, tapUpdate(ask.TapData(askQ, 1, 'o', 0), 711))
+		f.handle(t, tapUpdate(ask.TapData(askQ, 1, 'd', 0), 711))
+		if a := f.loadAsk(t, askQ); !a.Done || f.pending(t, sidShop) != 1 || len(f.marks(t, sidShop)) != 0 {
+			t.Fatalf("done=%v pending=%d marks=%+v", a.Done, f.pending(t, sidShop), f.marks(t, sidShop))
+		}
+	})
+	t.Run("the last open question", func(t *testing.T) {
+		f := newVoiceFixture(t, &transcriber{text: "Mango"})
+		f.putAsk(t, questionAsk(t, 710, 711))
+		f.handle(t, tapUpdate(ask.TapData(askQ, 1, 'o', 0), 711))
+		f.handle(t, tapUpdate(ask.TapData(askQ, 1, 'd', 0), 711))
+		if len(f.marks(t, sidShop)) != 0 {
+			t.Fatalf("buttons marked: %+v", f.marks(t, sidShop))
+		}
+		at := f.voiceAnswer(t, 710)
+		if a := f.loadAsk(t, askQ); !a.Done || f.pending(t, sidShop) != 1 {
+			t.Fatalf("done=%v pending=%d", a.Done, f.pending(t, sidShop))
+		}
+		f.markedOnce(t, sidShop, askQ, at)
+	})
+}
+
+// A voice answer whose ask cannot be saved is not counted: the credit and
+// the mark it added are taken back, and so is the mark alone of a followed
+// session, which gets no credit.
+func TestVoiceAnswerAskSaveFailsTakesBack(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into a read-only directory")
+	}
+	for _, c := range []struct {
+		name, id, sid, session string
+		msg                    int64
+	}{
+		{"credit and mark", askP, sidShop, "acme-shop-92", 700},
+		{"followed, mark only", askP2, sidBlog, "blog-6a", 720},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newVoiceFixture(t, &transcriber{text: "use pnpm instead"})
+			f.putAsk(t, permAsk(c.id, c.sid, c.session, c.msg))
+			k, id := f.confirm(t, f.voice(7, c.msg))
+			dir := filepath.Join(f.store.Dir, "asks")
+			if err := os.Chmod(dir, 0o500); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+			f.handle(t, tapUpdate("v:"+k+":y", id))
+			_ = os.Chmod(dir, 0o700)
+			if a := f.loadAsk(t, c.id); a.Done || f.pending(t, c.sid) != 0 || len(f.marks(t, c.sid)) != 0 {
+				t.Fatalf("done=%v pending=%d marks=%+v", a.Done, f.pending(t, c.sid), f.marks(t, c.sid))
+			}
+			if got := f.toasts(); len(got) != 1 || !strings.Contains(got[0], "could not read this request") {
+				t.Fatalf("toasts = %q", got)
+			}
+		})
+	}
+}
+
+// A hook still looking for its dialog (a call queued behind another, ruling
+// P25) claimed nothing and promises no buttons: the pane decides, here the
+// queued dialog tg's fallback can answer.
+func TestUnclaimedAskPromisesNoButtons(t *testing.T) {
+	f := newFixture(t)
+	a := permAsk(askP, sidShop, "acme-shop-92", 0)
+	a.MessageIDs, a.Texts = nil, nil
+	f.putAsk(t, a)
+	f.term.Screens["A1"] = termScreen(t, "mcp-queue-1of2.txt")
+	f.handle(t, f.msg("@acme-shop-92 run the tests", 0))
+	if want := "<b>acme-shop-92</b> is waiting on a permission prompt; answer it on the Mac, or send /approve or /deny"; len(f.term.Typed) != 0 || f.api.LastText() != want {
+		t.Fatalf("typed = %+v last = %q", f.term.Typed, f.api.LastText())
 	}
 }

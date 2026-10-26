@@ -51,6 +51,7 @@ type Ask struct {
 	TakeBack    bool              `json:"take_back,omitempty"`   // the Armed answer never reached Claude: it is owed back (Store.TakeBackAnswer; the sweep finishes it)
 	Closed      string            `json:"closed,omitempty"`      // "" | "mac" | "expired" | "ended"
 	Signature   string            `json:"signature,omitempty"`   // Fingerprint of the dialog or picker its hook adopted on the pane (ClaimSignature)
+	Keys        []string          `json:"keys,omitempty"`        // an MCP call's keys, every one of which its dialog shows: another hook yields a dialog showing them all (ruling P27)
 }
 
 // Open reports whether the ask still waits for an answer.

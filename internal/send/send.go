@@ -39,7 +39,7 @@ type Sender struct {
 	Sleep   func(time.Duration)  // overridable for tests; nil means context-aware real waiting
 	Now     func() time.Time     // overridable for tests
 	Log     func(string, ...any) // optional
-	Secrets []string             // strings that must never appear in a message (the bot token)
+	Secrets []string             // strings that must never appear in a message (config.Config.Secrets: the bot token, the TypeSafe key)
 }
 
 // Kind selects the header icon. The zero value is an alert.
@@ -115,6 +115,9 @@ const (
 	keepIDs       = 50
 	maxLabel      = 64
 	maxTitle      = 200
+	// maxVoiceDuration is the longest voice message SendVoice reports:
+	// far beyond any spoken answer, and its seconds fit Telegram's int.
+	maxVoiceDuration = 24 * time.Hour
 )
 
 // sleep waits d, or until ctx ends; it returns false when the context ended.
@@ -181,7 +184,7 @@ func (s *Sender) logf(format string, args ...any) {
 // messages are still undelivered, m is queued behind them instead of
 // overtaking them.
 func (s *Sender) Send(ctx context.Context, m Message) ([]int64, error) {
-	m.Label, m.Title, m.Body = s.scrub(m.Label), s.scrub(m.Title), s.Clean(m.Body)
+	m.Label, m.Title, m.Body = s.Clean(m.Label), s.scrub(m.Title), s.Clean(m.Body) // a label holds tab names and titles
 	chunks := render.Truncate(render.Chunk(m.Body, render.SourceChunk), render.MaxChunks)
 	if len(chunks) == 0 {
 		chunks = []string{""}
@@ -255,6 +258,26 @@ func temporary(err error) bool {
 // returned for the caller to spool.
 func (s *Sender) deliver(ctx context.Context, req telegram.SendRequest, plain string) (int64, error) {
 	fellBack := false
+	return s.paced(ctx, func() (int64, error) { return s.API.SendMessage(ctx, req) },
+		func(api *telegram.APIError) bool {
+			if api.Code != 400 || req.ParseMode == "" || fellBack {
+				return false
+			}
+			s.logf("400 on HTML (%s), resending as plain text", api.Description)
+			fellBack = true
+			req.ParseMode = ""
+			req.Text = plain
+			return true
+		})
+}
+
+// paced runs do under the cross-process pacing gate, up to maxAttempts times,
+// waiting out a 429's retry_after between tries. Any other API error goes to
+// rework: when it returns true it has changed what do sends and the retry is
+// free (not one of the attempts); nil or false returns the error. Transport
+// errors, exhausted throttling and context expiry are returned for the caller
+// to spool or give up on.
+func (s *Sender) paced(ctx context.Context, do func() (int64, error), rework func(*telegram.APIError) bool) (int64, error) {
 	throttled := 0
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		release, perr := s.Store.PaceCtx(ctx, s.MinGap)
@@ -265,7 +288,7 @@ func (s *Sender) deliver(ctx context.Context, req telegram.SendRequest, plain st
 			s.logf("pace: %v", perr)
 			release = func() {}
 		}
-		id, err := s.API.SendMessage(ctx, req)
+		id, err := do()
 		release()
 		if err == nil {
 			return id, nil
@@ -294,17 +317,54 @@ func (s *Sender) deliver(ctx context.Context, req telegram.SendRequest, plain st
 			if !s.sleep(ctx, wait) {
 				return 0, ctx.Err()
 			}
-		case api.Code == 400 && req.ParseMode != "" && !fellBack:
-			s.logf("400 on HTML (%s), resending as plain text", api.Description)
-			fellBack = true
-			req.ParseMode = ""
-			req.Text = plain
-			attempt-- // the fallback is not one of the three attempts
+		case rework != nil && rework(api):
+			attempt-- // the rework is not one of the three attempts
 		default:
 			return 0, err
 		}
 	}
 	return 0, fmt.Errorf("%w: gave up after %d attempts", errThrottled, maxAttempts)
+}
+
+// VoiceAPI is the part of the Telegram client that uploads voice messages. It
+// is separate from API so the many text-only fakes need no change.
+type VoiceAPI interface {
+	SendVoice(ctx context.Context, r telegram.VoiceRequest) (int64, error)
+}
+
+// SendVoice uploads audio (OGG/Opus, d long) as a voice message captioned
+// "🔊 " + label, scrubbed and clipped like a text header ("mac" when empty). It
+// is paced and retried on 429 like Send, but never spooled and never falls
+// back to text: a voice heard hours late would mislead, so every failure is
+// returned, and a duration that is not positive or over
+// maxVoiceDuration is refused before any request. On success the message
+// id is recorded for sessionID, so a swipe-reply to the voice reaches the
+// session.
+func (s *Sender) SendVoice(ctx context.Context, sessionID, label string, audio []byte, d time.Duration, silent bool) (int64, error) {
+	api, ok := s.API.(VoiceAPI)
+	if !ok {
+		return 0, errors.New("telegram client cannot send voice")
+	}
+	label = clip(s.Clean(label), maxLabel)
+	if label == "" {
+		label = "mac"
+	}
+	if d <= 0 || d > maxVoiceDuration {
+		return 0, fmt.Errorf("unsupported voice duration: %v", d)
+	}
+	// Whole seconds, rounded up; quotient and remainder, as adding a
+	// second less a nanosecond first could overflow.
+	secs := int(d / time.Second)
+	if d%time.Second != 0 {
+		secs++
+	}
+	req := telegram.VoiceRequest{ChatID: s.ChatID, Audio: audio, Duration: secs, Caption: "🔊 " + label, Silent: silent}
+	id, err := s.paced(ctx, func() (int64, error) { return api.SendVoice(ctx, req) }, nil)
+	if err != nil {
+		return 0, err
+	}
+	s.record(sessionID, []int64{id}, false)
+	return id, nil
 }
 
 // spoolFrom stores chunks[from:] for a later flush, in order.

@@ -8,13 +8,16 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/IZZY-Agency/claude-tg/internal/render"
 	"github.com/IZZY-Agency/claude-tg/internal/send"
 	"github.com/IZZY-Agency/claude-tg/internal/session"
+	"github.com/IZZY-Agency/claude-tg/internal/speech"
 	"github.com/IZZY-Agency/claude-tg/internal/state"
 	"github.com/IZZY-Agency/claude-tg/internal/telegram"
 	"github.com/IZZY-Agency/claude-tg/internal/term"
@@ -27,12 +30,16 @@ type API interface {
 	AnswerCallbackQuery(ctx context.Context, id, text string) error
 	EditMessage(ctx context.Context, chatID, messageID int64, text, parseMode string, kb [][]telegram.Button) error
 	EditReplyMarkup(ctx context.Context, chatID, messageID int64, kb [][]telegram.Button) error
+	GetFile(ctx context.Context, fileID string) (telegram.File, error)
+	Download(ctx context.Context, filePath string, max int64) ([]byte, error)
 }
 
 // Agents lists the live Claude Code sessions.
 type Agents func(ctx context.Context) ([]session.Agent, error)
 
-// Router handles one update at a time.
+// Router handles one update at a time. Voice notes are transcribed beside
+// it, one at a time, by a worker started on demand (voiceWorker); its
+// exported fields are set before the first update and only read after.
 type Router struct {
 	API       API
 	Store     *state.Store
@@ -45,14 +52,23 @@ type Router struct {
 	Log       func(string, ...any)
 	StartedAt time.Time
 	Alive     func(pid int) bool // is a waiting hook's process alive; nil: signal 0
-	Secrets   []string           // never shown in a message, a button or a toast (the bot token), as send.Sender.Secrets
+	Secrets   []string           // never shown in a message, a button or a toast (the bot token, the TypeSafe key), as send.Sender.Secrets
+	// Transcriber turns voice notes into text (the owner's voice_command);
+	// nil: voice notes are not configured and get a reply saying so.
+	Transcriber Transcriber
 
 	afterApply func(askID string) // tests: runs between saving a tap's or reply's result and acting on it
+
+	voiceMu sync.Mutex             // guards voiceQ
+	voiceQ  chan *telegram.Message // the running voice worker's queue; nil when none runs
+	voiceWG sync.WaitGroup         // notes queued or being transcribed
 }
 
 // Live is a running session as the relay sees it.
 type Live struct {
-	Name      string
+	Name      string // the session's label (session.Label), told apart from another live one alike
+	Claude    string // Claude Code's name, which addresses the session too
+	Full      string // the label in full when Name is cut, which addresses the session too
 	SessionID string
 	Pane      term.Pane
 	Cwd       string
@@ -68,7 +84,7 @@ const (
 
 // Commands is the "/" menu the relay registers.
 var Commands = []telegram.BotCommand{
-	{Command: "sessions", Description: "live sessions and follow state"},
+	{Command: "sessions", Description: "live sessions: pick one to talk to"},
 	{Command: "follow", Description: "follow a session: /follow name"},
 	{Command: "unfollow", Description: "stop following: /unfollow name"},
 	{Command: "approve", Description: "fallback: approve a permission prompt (reply to it or @name)"},
@@ -84,9 +100,11 @@ func (r *Router) now() time.Time {
 	return time.Now()
 }
 
+// logf logs a line with the secrets scrubbed and credentials redacted:
+// session names, which come from tab names and titles, go into it.
 func (r *Router) logf(format string, args ...any) {
 	if r.Log != nil {
-		r.Log(format, args...)
+		r.Log("%s", render.Redact(r.scrub(fmt.Sprintf(format, args...))))
 	}
 }
 
@@ -161,6 +179,12 @@ func (r *Router) Handle(ctx context.Context, u telegram.Update) error {
 		r.logf("dropped message from %v in chat %d", m.From, m.Chat.ID)
 		return nil
 	}
+	if m.Voice != nil {
+		return r.voiceNote(ctx, m)
+	}
+	if m.Text == "" && m.HasMedia() {
+		return r.reply(ctx, m, otherMedia)
+	}
 	text := strings.TrimSpace(m.Text)
 	if text == "" {
 		return nil
@@ -169,17 +193,29 @@ func (r *Router) Handle(ctx context.Context, u telegram.Update) error {
 	// it (one answered but not yet collected by its hook says so), even when
 	// it starts with "/" like a path; only /approve and /deny stay commands.
 	// A reply to a closed one is a prompt or command for its session as usual.
-	if m.ReplyToMessage != nil {
-		if cmd, _ := ParseCommand(text); cmd != "approve" && cmd != "deny" {
-			if a, i, ok := r.Store.FindAskByMessageID(m.ReplyToMessage.MessageID); ok && (a.Open() || a.Done && !r.hookGone(a)) {
-				return r.replyToAsk(ctx, m, a.ID, i, text)
-			}
+	if cmd, _ := ParseCommand(text); cmd != "approve" && cmd != "deny" {
+		if a, i, ok := r.askReplied(m); ok {
+			return r.replyToAsk(ctx, m, a.ID, i, text)
 		}
 	}
 	if strings.HasPrefix(text, "/") {
 		return r.command(ctx, m, text)
 	}
 	return r.text(ctx, m, text)
+}
+
+// askReplied returns the ask whose message m swipe-replies to, and that
+// message's question index, while the ask still takes a reply: open, or
+// answered and not yet collected by its live hook (the reply then says so).
+func (r *Router) askReplied(m *telegram.Message) (*state.Ask, int, bool) {
+	if m.ReplyToMessage == nil {
+		return nil, 0, false
+	}
+	a, i, ok := r.Store.FindAskByMessageID(m.ReplyToMessage.MessageID)
+	if !ok || !(a.Open() || a.Done && !r.hookGone(a)) {
+		return nil, 0, false
+	}
+	return a, i, true
 }
 
 func (r *Router) live(ctx context.Context) ([]Live, error) {
@@ -194,14 +230,75 @@ func (r *Router) live(ctx context.Context) ([]Live, error) {
 			r.logf("session %s: %v (skipped)", a.SessionID, err)
 			continue
 		}
-		name := a.Name
+		name := sess.Name // the label the hooks keep
 		if name == "" {
-			name = sess.Name
+			name = a.Name
 		}
-		out = append(out, Live{Name: name, SessionID: a.SessionID, Pane: sess.Pane(), Cwd: a.Cwd, Busy: a.Busy(), Follow: sess.Follow})
+		name, claude := r.shown(name), render.FullName(r.scrub(a.Name)) // Claude Code's name, matched whole
+		full := ""
+		switch {
+		case sess.FullLabel != "":
+			full = render.FullName(r.scrub(sess.FullLabel))
+		case sess.Tab != "": // a record written before FullLabel: the label was the tab name
+			full = render.FullName(r.scrub(sess.Tab))
+		}
+		out = append(out, Live{Name: name, Claude: claude, Full: full, SessionID: a.SessionID, Pane: sess.Pane(), Cwd: a.Cwd, Busy: a.Busy(), Follow: sess.Follow})
 	}
+	distinguish(out)
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+// shown is a session name as every message shows it (render.ShownName),
+// the secrets scrubbed first: a record stored by an older tg is shaped as
+// the hooks now store names. Sessions are named and matched as shown, so
+// that a name copied from a message addresses the session it names.
+func (r *Router) shown(name string) string {
+	return render.ShownName(r.scrub(name))
+}
+
+// distinguish appends " · <suffix>" to the names live sessions share,
+// ignoring case, so that every name is unique: the part of Claude Code's
+// name after its last "-" when it is 1 to 4 characters and unique, else
+// the session id's first 4, 8 characters, or all of it (spec
+// 2026-10-26-session-labels-and-picker-design.md, Duplicates).
+func distinguish(live []Live) {
+	count := map[string]int{}
+	for _, l := range live {
+		count[strings.ToLower(l.Name)]++
+	}
+	taken := map[string]bool{}
+	for _, l := range live {
+		if count[strings.ToLower(l.Name)] < 2 {
+			taken[strings.ToLower(l.Name)] = true
+		}
+	}
+	for i, l := range live {
+		if count[strings.ToLower(l.Name)] < 2 {
+			continue
+		}
+		var suffixes []string
+		if j := strings.LastIndex(l.Claude, "-"); j >= 0 && len(l.Claude)-j-1 >= 1 && len(l.Claude)-j-1 <= 4 {
+			suffixes = append(suffixes, l.Claude[j+1:])
+		}
+		for _, n := range []int{4, 8} {
+			if len(l.SessionID) > n {
+				suffixes = append(suffixes, l.SessionID[:n])
+			}
+		}
+		suffixes = append(suffixes, l.SessionID)
+		for n := 2; n <= len(live)+1; n++ { // more than the other names can take
+			suffixes = append(suffixes, l.SessionID+"-"+strconv.Itoa(n))
+		}
+		for _, suffix := range suffixes {
+			name := l.Name + " · " + suffix
+			if !taken[strings.ToLower(name)] {
+				live[i].Name = name
+				taken[strings.ToLower(name)] = true
+				break
+			}
+		}
+	}
 }
 
 // reachable returns nil when the session's pane can be typed into, else the
@@ -224,6 +321,32 @@ func names(live []Live) []string {
 	return out
 }
 
+// named are every name of the live sessions, keyed by session: its name,
+// its label in full when the name is cut, and Claude Code's, which keeps
+// addressing it (spec 2026-10-26-session-labels-and-picker-design.md,
+// Addressing).
+func named(live []Live) []Named {
+	var out []Named
+	for _, l := range live {
+		out = append(out, Named{Name: l.Name, Key: l.SessionID})
+		for _, alias := range []string{l.Full, l.Claude} {
+			if alias != "" && alias != l.Name {
+				out = append(out, Named{Name: alias, Key: l.SessionID})
+			}
+		}
+	}
+	return out
+}
+
+// matchLive is MatchNamed over the live sessions' names.
+func matchLive(cand string, live []Live) (*Live, bool) {
+	key, ok := MatchNamed(cand, named(live))
+	if !ok {
+		return nil, false
+	}
+	return bySession(live, key), true
+}
+
 func bySession(live []Live, sessionID string) *Live {
 	for i := range live {
 		if live[i].SessionID == sessionID {
@@ -233,9 +356,16 @@ func bySession(live []Live, sessionID string) *Live {
 	return nil
 }
 
+// byName finds the live session with this name, or else with this Claude
+// Code name.
 func byName(live []Live, name string) *Live {
 	for i := range live {
 		if live[i].Name == name {
+			return &live[i]
+		}
+	}
+	for i := range live {
+		if live[i].Claude == name {
 			return &live[i]
 		}
 	}
@@ -256,10 +386,13 @@ func followed(live []Live) []Live {
 // keyboard should be shown.
 var errNeedTarget = errors.New("need target")
 
-// target picks the session a message addresses: swipe-reply, @name / name:,
-// then the single followed session. It returns the remaining text. A reply
-// to a message no session is known to have sent, or to an ended session,
-// is refused outright: never guess for an explicit reply.
+// target picks the session a message addresses: swipe-reply, @name / name:
+// (both for this message only), the session picked in /sessions, then the
+// single followed session. It returns the remaining text. A reply to a
+// message no session is known to have sent, or to an ended session, is
+// refused outright: never guess for an explicit reply. A pick whose
+// session has ended is dropped, and the message gets the keyboard with a
+// note (pickEnded); a pick that cannot be read refuses the message.
 func (r *Router) target(m *telegram.Message, text string, live []Live) (*Live, string, error) {
 	if m.ReplyToMessage != nil {
 		sess, ok := r.Store.FindSessionByMessageID(m.ReplyToMessage.MessageID)
@@ -271,11 +404,21 @@ func (r *Router) target(m *telegram.Message, text string, live []Live) (*Live, s
 		}
 		return nil, "", fmt.Errorf("%s has ended; pick another session", bold(sess.Name))
 	}
-	switch a := Address(text, names(live)); a.Kind {
+	switch a := AddressNamed(text, named(live)); a.Kind {
 	case AddrResolved:
-		return byName(live, a.Name), a.Rest, nil
+		return bySession(live, a.Key), a.Rest, nil
 	case AddrAmbiguous, AddrUnknown:
 		return nil, text, errNeedTarget
+	}
+	p, ok, err := r.currentPick()
+	switch {
+	case err != nil:
+		return nil, "", err
+	case ok:
+		if l := bySession(live, p.SessionID); l != nil {
+			return l, text, nil
+		}
+		return nil, text, r.endedPick(p.SessionID)
 	}
 	if f := followed(live); len(f) == 1 {
 		return bySession(live, f[0].SessionID), text, nil
@@ -290,14 +433,18 @@ func (r *Router) text(ctx context.Context, m *telegram.Message, text string) err
 	}
 	l, rest, err := r.target(m, text, live)
 	if errors.Is(err, errNeedTarget) {
-		return r.askWhich(ctx, m, text, live)
+		return r.askWhich(ctx, m, text, live, r.endedNote(err))
 	}
 	if err != nil {
 		return r.reply(ctx, m, err.Error())
 	}
-	note, err := r.deliver(ctx, l, rest)
+	queued, err := r.deliver(ctx, l, rest, false)
 	if err != nil {
 		return r.reply(ctx, m, err.Error())
+	}
+	note := ""
+	if queued {
+		note = queuedNote(l.Name)
 	}
 	if !r.react(ctx, m, "👍") {
 		if note == "" {
@@ -319,37 +466,48 @@ func (r *Router) text(ctx context.Context, m *telegram.Message, text string) err
 // Nothing is typed while the session waits on a question or permission
 // prompt a hook handles, sent here or not yet: the picker is open at the
 // Mac and the answer belongs on its message.
-// The returned error text is HTML for the user; note is a follow-up such as
-// "queued".
-func (r *Router) deliver(ctx context.Context, l *Live, text string) (string, error) {
+// Once the text is submitted, the line typed is recorded in the session
+// (state.Session.RecordPhoneLine), so that the hooks know the turn it
+// starts as the phone's. With voice the text is a voice note's transcript,
+// and the same write marks the session (state.Session.MarkVoice), so that
+// its next answer is spoken. Both come only then, unlike the answers owed,
+// which are armed before typing: a busy session's running turn may stop
+// while the text is typed, and its Stop hook must find no mark to spend
+// for a text that may still fail. A delivery that fails before the submit
+// records and marks nothing; one whose submit is unknown records and marks,
+// as its answers stay owed. A submitted text refreshes the pick when the
+// pick names the session (usedPick), whatever route the text took.
+// The returned error text is HTML for the user; queued reports that the
+// session was busy, so the text waits behind its running turn.
+func (r *Router) deliver(ctx context.Context, l *Live, text string, voice bool) (queued bool, err error) {
 	if err := r.askRefusal(l); err != nil {
-		return "", err
+		return false, err
 	}
 	line := term.OneLine(text)
 	if n := utf8.RuneCountInString(line); n > maxText {
-		return "", fmt.Errorf("too long: %d characters, the limit is %d", n, maxText)
+		return false, fmt.Errorf("too long: %d characters, the limit is %d", n, maxText)
 	}
 	if line == "" {
-		return "", errors.New("nothing to type")
+		return false, errors.New("nothing to type")
 	}
 	if err := r.reachable(ctx, l); err != nil {
-		return "", err
+		return false, err
 	}
 	screen, err := r.Term.Screen(ctx, l.Pane, screenLines)
 	if err != nil {
-		return "", fmt.Errorf("cannot read %s: %s", bold(l.Name), render.EscapeHTML(err.Error()))
+		return false, fmt.Errorf("cannot read %s: %s", bold(l.Name), render.EscapeHTML(err.Error()))
 	}
 	if why := refusal(l.Name, screen); why != "" {
-		return "", errors.New(why)
+		return false, errors.New(why)
 	}
 	owed := 1
 	if l.Busy {
 		owed = 2 // the running turn's answer and the queued one
 	}
 	r.armAnswers(l, owed)
-	fail := func(format string, args ...any) (string, error) {
+	fail := func(format string, args ...any) (bool, error) {
 		r.armAnswers(l, -owed)
-		return "", fmt.Errorf(format, args...)
+		return false, fmt.Errorf(format, args...)
 	}
 	typed := " " + line
 	want := normalize(typed)
@@ -376,13 +534,35 @@ func (r *Router) deliver(ctx context.Context, l *Live, text string) (string, err
 		}
 	}
 	if err := r.Term.Type(ctx, l.Pane, term.Enter); err != nil {
-		return fail("could not submit in %s: %s", bold(l.Name), render.EscapeHTML(err.Error()))
+		// The text may have gone through: its answers stay owed to the
+		// phone (ruling R30), unlike fail's, and the line is recorded and
+		// a voice note marks the session as a submitted one does.
+		r.submitted(l, line, voice)
+		return false, &submitUnknown{name: l.Name, cause: err}
 	}
+	r.submitted(l, line, voice)
+	r.usedPick(l.SessionID)
 	r.logf("delivered %d characters to %s (busy=%v)", utf8.RuneCountInString(line), l.Name, l.Busy)
-	if l.Busy {
-		return fmt.Sprintf("queued in %s (busy)", bold(l.Name)), nil
-	}
-	return "", nil
+	return l.Busy, nil
+}
+
+// submitUnknown is deliver's error when the Enter that submits the text
+// failed: the text was typed and checked, and the Enter may still have
+// reached the pane before the terminal backend failed, so whether the text
+// was submitted is unknown. The answers deliver armed stay armed. Its text
+// is the refusal for typed text (HTML); cause is the backend's error.
+type submitUnknown struct {
+	name  string
+	cause error
+}
+
+func (e *submitUnknown) Error() string {
+	return fmt.Sprintf("could not submit in %s: %s", bold(e.name), render.EscapeHTML(e.cause.Error()))
+}
+
+// queuedNote is the typed text's follow-up when deliver queued it (HTML).
+func queuedNote(name string) string {
+	return fmt.Sprintf("queued in %s (busy)", bold(name))
 }
 
 const (
@@ -556,7 +736,7 @@ func InputText(screen string) string {
 // negative to roll back a failed delivery). Followed sessions report every
 // answer anyway.
 func (r *Router) armAnswers(l *Live, n int) {
-	if l.Follow || n == 0 {
+	if n == 0 || l.Follow {
 		return
 	}
 	if _, err := r.Store.UpdateSession(l.SessionID, func(s *state.Session) {
@@ -566,6 +746,61 @@ func (r *Router) armAnswers(l *Live, n int) {
 		}
 	}); err != nil {
 		r.logf("pending answers: %v", err)
+	}
+}
+
+// typingAnswer is decide's one session write right before it types the
+// /approve or /deny fallback into the session's dialog, followed or not:
+// the answer the session then owes the phone (as armAnswers) and the time
+// (state.Session.PhoneAnswerAt, ruling P20), so the waiting hook that sees
+// the dialog close does not take the phone's answer for one at the Mac,
+// which would end a turn the phone started. It returns the time recorded
+// before, for typedNoAnswer.
+func (r *Router) typingAnswer(l *Live, at time.Time) (prev time.Time) {
+	if _, err := r.Store.UpdateSession(l.SessionID, func(s *state.Session) {
+		prev, s.PhoneAnswerAt = s.PhoneAnswerAt, at
+		if !l.Follow {
+			s.PendingAnswers++
+		}
+	}); err != nil {
+		r.logf("before the fallback answer: %v", err)
+	}
+	return prev
+}
+
+// typedNoAnswer takes back what typingAnswer recorded at at when the
+// keystroke failed: the answer owed, and the time, unless a later one
+// replaced it.
+func (r *Router) typedNoAnswer(l *Live, at, prev time.Time) {
+	if _, err := r.Store.UpdateSession(l.SessionID, func(s *state.Session) {
+		if s.PhoneAnswerAt.Equal(at) {
+			s.PhoneAnswerAt = prev
+		}
+		if !l.Follow && s.PendingAnswers > 0 {
+			s.PendingAnswers--
+		}
+	}); err != nil {
+		r.logf("after a failed fallback answer: %v", err)
+	}
+}
+
+// submitted is the one session write after deliver submitted line to the
+// session (or may have: ruling R30), followed or not. It records the line
+// (state.Session.RecordPhoneLine), so that the hooks know the turn it
+// starts as the phone's, marked queued when the session was busy: Claude
+// Code takes the text in only when the running step ends (ruling P15).
+// For a voice note's transcript it marks the session
+// (state.Session.MarkVoice), so that its next answer is spoken even when
+// nothing is owed.
+func (r *Router) submitted(l *Live, line string, voice bool) {
+	now := r.now()
+	if _, err := r.Store.UpdateSession(l.SessionID, func(s *state.Session) {
+		s.RecordPhoneLine(line, now, l.Busy)
+		if voice {
+			s.MarkVoice("", speech.Language(line), now)
+		}
+	}); err != nil {
+		r.logf("after submit: %v", err)
 	}
 }
 
@@ -591,16 +826,22 @@ func KeyboardFor(live []Live, key string) [][]telegram.Button {
 	return rows
 }
 
-func (r *Router) askWhich(ctx context.Context, m *telegram.Message, text string, live []Live) error {
+// noTypeable is the reply when no live session can be offered on the
+// session keyboard.
+const noTypeable = "no live session has a terminal pane I can type into"
+
+// askWhich parks the text and asks which session it is for, with the
+// session keyboard, under note when there is one (endedNote).
+func (r *Router) askWhich(ctx context.Context, m *telegram.Message, text string, live []Live, note string) error {
 	key := newKey()
 	kb := KeyboardFor(live, key)
 	if len(kb) == 0 {
-		return r.reply(ctx, m, "no live session has a terminal pane I can type into")
+		return r.reply(ctx, m, withNote(note, noTypeable))
 	}
-	if err := r.Store.PutPending(key, text, r.now()); err != nil {
+	if err := r.Store.PutPending(key, state.Parked{Text: text, MessageID: m.MessageID, Created: r.now()}); err != nil {
 		return r.reply(ctx, m, "cannot park the message: "+render.EscapeHTML(err.Error()))
 	}
-	_, err := r.send(ctx, m.MessageID, "Which session?", kb)
+	_, err := r.send(ctx, m.MessageID, withNote(note, "Which session?"), kb)
 	return err
 }
 
@@ -611,6 +852,12 @@ func (r *Router) handleCallback(ctx context.Context, cq *telegram.CallbackQuery)
 	}
 	if strings.HasPrefix(cq.Data, "a:") {
 		return r.tap(ctx, cq)
+	}
+	if strings.HasPrefix(cq.Data, "v:") {
+		return r.voiceTap(ctx, cq)
+	}
+	if strings.HasPrefix(cq.Data, pickData) {
+		return r.pickTap(ctx, cq)
 	}
 	answer := func(text string) { r.answerCallback(ctx, cq, text) }
 	edit := func(html string) {
@@ -626,8 +873,20 @@ func (r *Router) handleCallback(ctx context.Context, cq *telegram.CallbackQuery)
 		answer("unknown button")
 		return nil
 	}
-	text, ok := r.Store.TakePending(parts[2], r.now(), pendingTTL)
-	if !ok {
+	p, ok := r.Store.TakePending(parts[2], r.now(), pendingTTL)
+	// A voice transcript has its own outcomes (voicePick); an expired one
+	// is handed out too, so its note's 👀 can be cleared.
+	if p.Voice {
+		return r.voicePick(ctx, cq, parts[1], parts[2], p, ok)
+	}
+	switch {
+	case !ok && p.Created.IsZero():
+		// Nothing parked: an earlier tap took it (text or voice, which cannot
+		// be told apart now) and its outcome is on the message, which stays
+		// (ruling R16).
+		answer(expiredToast)
+		return nil
+	case !ok:
 		answer("expired, send the text again")
 		edit("expired; send the text again")
 		return nil
@@ -643,15 +902,18 @@ func (r *Router) handleCallback(ctx context.Context, cq *telegram.CallbackQuery)
 		edit("that session is gone")
 		return nil
 	}
-	note, err := r.deliver(ctx, l, text)
+	queued, err := r.deliver(ctx, l, p.Text, false)
 	if err != nil {
 		answer(stripTags(err.Error()))
 		edit("✗ " + err.Error())
 		return nil
 	}
+	if p.MessageID != 0 {
+		r.react(ctx, &telegram.Message{MessageID: p.MessageID}, "👍")
+	}
 	msg := "→ " + bold(l.Name)
-	if note != "" {
-		msg += " · " + note
+	if queued {
+		msg += " · queued (busy)" // the session is named once (ruling R29)
 	}
 	edit(msg)
 	answer("sent to " + l.Name)
@@ -679,16 +941,19 @@ const helpText = `<b>Talking to a session</b>
 Every message here comes from one Claude Code session; its name is in bold at the top.
 • <b>Reply to a session's message</b> (swipe it) and your text goes to that session.
 • Or start with <code>@name</code>, for example <code>@acme run the tests again</code>. A unique start of the name is enough.
-• With exactly one followed session, plain text goes there. Otherwise I ask which session and show buttons.
+• Or pick a session in <code>/sessions</code>: plain text and voice notes go to it until you pick another or tap ✖ Clear, or an hour after the pick or your last message to it. A reply or <code>@name</code> still goes where it points.
+• Without a pick, and with exactly one followed session, plain text goes there. Otherwise I ask which session and show buttons.
+• Or send a <b>voice note</b>: I reply with the transcript and buttons, and type it only after you tap ✅ Send (needs <code>voice_command</code>, see the README).
+• A short answer to a voice note comes back spoken too, before the text (needs <code>speech_command</code>, see the README).
 Your text is typed into the session as its next prompt, and that session's next answer comes back here.
 
 <b>Questions and permission prompts</b> 🔐 ✋
-While you are away from the Mac, a session's question or permission prompt comes here with buttons.
+While you are away from the Mac, or the session is working on something you sent from the phone, a session's question or permission prompt comes here with buttons.
 • Tap a button to answer. ✅ Yes approves, ❌ No denies and stops the turn. A question takes the option you tap; with several allowed, tick them, then tap Done.
 • Or reply to the message (swipe it): your text answers a question, or denies a permission prompt and tells Claude why.
 Until you answer, other text for that session is refused.
-The fallback commands <code>/approve</code> and <code>/deny</code> answer a prompt that has buttons here like ✅ Yes and ❌ No. With none here, they type only into a plain Bash or Read "Do you want to proceed?" dialog (1, or Esc); any other prompt is answered at the Mac.
-Plan approval, MCP tool prompts and subagent prompts have no buttons: answer them at the Mac.
+The fallback commands <code>/approve</code> and <code>/deny</code> answer a prompt that has buttons here like ✅ Yes and ❌ No. With none here, they type only into a plain Bash, Read or MCP "Do you want to proceed?" dialog (1, or Esc); any other prompt is answered at the Mac.
+Plan approval and subagent prompts have no buttons: answer them at the Mac.
 Target them by replying to the 🔐 message (that prompt, and only while it is open), or <code>/approve @name</code> (the newest).
 
 <b>Following a session</b> 💬
@@ -696,22 +961,37 @@ Target them by replying to the 🔐 message (that prompt, and only while it is o
 <code>/unfollow name</code> — stop
 
 <b>More</b>
-<code>/sessions</code> — live sessions: busy or idle, follow on or off
+<code>/sessions</code> — live sessions: busy or idle, follow on or off; tap one to pick it
 <code>/status</code> — relay status
 <code>/help</code> — this text
 
 <b>Icons</b>
 🔔 alert · 📋 report · 💬 answer · 🔐 needs approval · ✋ needs input · 💥 session stopped · ⚙️ system
 <b>Feedback on your messages</b>
-👍 delivered · 👌 approved · 👎 denied · otherwise I reply with the reason`
+👀 transcribing a voice note · 👍 delivered · 👌 approved · 👎 denied · otherwise I reply with the reason`
 
+// sessions is /sessions: one line per live session, and a button per
+// session to pick it (pickKeyboard); while a pick is active, a line naming
+// it and ✖ Clear. A pick whose session has ended is dropped; one that
+// cannot be read is reported, with ✖ Clear, with no live session too.
 func (r *Router) sessions(ctx context.Context, m *telegram.Message) error {
 	live, err := r.live(ctx)
 	if err != nil {
 		return r.reply(ctx, m, "cannot list sessions: "+render.EscapeHTML(err.Error()))
 	}
+	var picked *Live
+	p, ok, pickErr := r.currentPick()
+	if ok {
+		if picked = bySession(live, p.SessionID); picked == nil {
+			r.dropPick(p.SessionID)
+		}
+	}
 	if len(live) == 0 {
-		return r.reply(ctx, m, "no live sessions")
+		if pickErr == nil {
+			return r.reply(ctx, m, "no live sessions")
+		}
+		_, err = r.send(ctx, m.MessageID, "📌 "+pickErr.Error()+"\nno live sessions", pickKeyboard(nil, true))
+		return err
 	}
 	var b strings.Builder
 	for _, l := range live {
@@ -729,18 +1009,29 @@ func (r *Router) sessions(ctx context.Context, m *telegram.Message) error {
 		}
 		fmt.Fprintf(&b, "%s · %s · %s · %s%s\n", bold(l.Name), status, follow, render.EscapeHTML(filepath.Base(l.Cwd)), pane)
 	}
-	return r.reply(ctx, m, strings.TrimRight(b.String(), "\n"))
+	switch {
+	case pickErr != nil:
+		b.WriteString("\n📌 " + pickErr.Error())
+	case picked != nil:
+		b.WriteString("\n" + pickNow + bold(picked.Name))
+	}
+	kb := pickKeyboard(live, picked != nil || pickErr != nil)
+	if len(kb) == 0 {
+		kb = nil
+	}
+	_, err = r.send(ctx, m.MessageID, strings.TrimRight(b.String(), "\n"), kb)
+	return err
 }
 
 // pick resolves a command's target: explicit name, swipe-reply, else the
 // single followed session.
 func (r *Router) pick(m *telegram.Message, arg string, live []Live) (*Live, string) {
 	if arg != "" {
-		name, ok := MatchName(arg, names(live))
+		l, ok := matchLive(arg, live)
 		if !ok {
 			return nil, "no live session matches " + bold(arg)
 		}
-		return byName(live, name), ""
+		return l, ""
 	}
 	if m.ReplyToMessage != nil {
 		sess, ok := r.Store.FindSessionByMessageID(m.ReplyToMessage.MessageID)
@@ -758,6 +1049,8 @@ func (r *Router) pick(m *telegram.Message, arg string, live []Live) (*Live, stri
 	return nil, "say which session: add @name or reply to its message"
 }
 
+// setFollow is /follow (want) or /unfollow; unfollowing also forgets the
+// session's voice marks in the same write (state.Session.SetFollow).
 func (r *Router) setFollow(ctx context.Context, m *telegram.Message, arg string, want bool) error {
 	live, err := r.live(ctx)
 	if err != nil {
@@ -767,7 +1060,7 @@ func (r *Router) setFollow(ctx context.Context, m *telegram.Message, arg string,
 	if l == nil {
 		return r.reply(ctx, m, why)
 	}
-	if _, err := r.Store.UpdateSession(l.SessionID, func(s *state.Session) { s.Follow = want }); err != nil {
+	if _, err := r.Store.UpdateSession(l.SessionID, func(s *state.Session) { s.SetFollow(want) }); err != nil {
 		return r.reply(ctx, m, "cannot update "+bold(l.Name)+": "+render.EscapeHTML(err.Error()))
 	}
 	if want {
@@ -841,9 +1134,10 @@ func (r *Router) decide(ctx context.Context, m *telegram.Message, arg string, ap
 	if !approve {
 		keys, emoji, word = term.Escape, "👎", "denied"
 	}
-	r.armAnswers(l, 1)
+	at := r.now()
+	prev := r.typingAnswer(l, at)
 	if err := r.Term.Type(ctx, l.Pane, keys); err != nil {
-		r.armAnswers(l, -1)
+		r.typedNoAnswer(l, at, prev)
 		return r.reply(ctx, m, "could not type into "+bold(l.Name)+": "+render.EscapeHTML(err.Error()))
 	}
 	if !r.react(ctx, m, emoji) {

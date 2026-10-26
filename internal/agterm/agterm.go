@@ -81,6 +81,56 @@ func (c *CLI) Exists(ctx context.Context, p term.Pane) bool {
 	return false
 }
 
+// Tab is an agterm session's tab: its name, which the owner may have set,
+// and its terminal title.
+type Tab struct {
+	Name  string
+	Title string
+}
+
+// Tab returns the tab of agterm session id. ok is false, with no error,
+// when the tree has no such session.
+func (c *CLI) Tab(ctx context.Context, id string) (Tab, bool, error) {
+	out, err := c.run(ctx, "", "tree", "--json")
+	if err != nil {
+		return Tab{}, false, err
+	}
+	t, ok := findTab(out, id)
+	return t, ok, nil
+}
+
+// findTab finds session id, ignoring case, in an agterm tree printed by
+// `agtermctl tree --json`.
+func findTab(tree []byte, id string) (Tab, bool) {
+	if id == "" {
+		return Tab{}, false
+	}
+	var t struct {
+		Result struct {
+			Tree struct {
+				Workspaces []struct {
+					Sessions []struct {
+						ID    string `json:"id"`
+						Name  string `json:"name"`
+						Title string `json:"title"`
+					} `json:"sessions"`
+				} `json:"workspaces"`
+			} `json:"tree"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(tree, &t) != nil {
+		return Tab{}, false
+	}
+	for _, ws := range t.Result.Tree.Workspaces {
+		for _, s := range ws.Sessions {
+			if strings.EqualFold(s.ID, id) {
+				return Tab{Name: s.Name, Title: s.Title}, true
+			}
+		}
+	}
+	return Tab{}, false
+}
+
 // Type injects text into the session's primary pane.
 func (c *CLI) Type(ctx context.Context, p term.Pane, text string) error {
 	_, err := c.run(ctx, text, "session", "type", "--stdin", "--target", p.Target)

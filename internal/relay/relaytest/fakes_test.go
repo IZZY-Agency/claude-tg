@@ -38,3 +38,19 @@ func TestRenderReplacesOnlyTheInputPromptLine(t *testing.T) {
 		t.Fatalf("the picker's cursor line was taken for the input prompt: input=%q\n%s", tm.Input("P"), shown)
 	}
 }
+
+// A reaction on a done ctx fails and is not recorded, as a request would.
+func TestReactionOnDoneContextFails(t *testing.T) {
+	a := &API{}
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := a.SetMessageReaction(ctx, 1, 500, "👀"); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := a.SetMessageReaction(ctx, 1, 500, ""); err == nil {
+		t.Fatal("a reaction on a cancelled ctx succeeded")
+	}
+	if got := a.Reacted(); len(got) != 1 || got[0] != (Reaction{500, "👀"}) {
+		t.Fatalf("reactions = %+v", got)
+	}
+}

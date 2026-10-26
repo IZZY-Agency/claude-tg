@@ -89,9 +89,22 @@ func (s *Store) RelayServes(feature string) bool {
 	return err == nil && slices.Contains(rs.Features, feature)
 }
 
-type pending struct {
-	Text    string    `json:"text"`
-	Created time.Time `json:"created"`
+// Parked is a text parked until a keyboard button picks its target, or a
+// voice note's transcript parked until the owner confirms it.
+type Parked struct {
+	Text string `json:"text"`
+	// MessageID is the owner's message, which gets the 👍 once delivered.
+	MessageID int64     `json:"message_id,omitempty"`
+	Created   time.Time `json:"created"`
+	// Voice marks a transcript waiting on its confirmation's buttons. Its
+	// target, when known, is the session SessionID, or question AskIndex of
+	// ask AskID for a swipe-reply to a prompt's message. Header is the
+	// confirmation's first line (HTML), kept for the edits that follow.
+	Voice     bool   `json:"voice,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+	AskID     string `json:"ask_id,omitempty"`
+	AskIndex  int    `json:"ask_index,omitempty"`
+	Header    string `json:"header,omitempty"`
 }
 
 func (s *Store) pendingPath(key string) string {
@@ -99,34 +112,37 @@ func (s *Store) pendingPath(key string) string {
 }
 
 // PutPending parks a text until a keyboard button picks its target.
-func (s *Store) PutPending(key, text string, now time.Time) error {
+func (s *Store) PutPending(key string, p Parked) error {
 	if err := os.MkdirAll(filepath.Join(s.Dir, "pending"), 0o700); err != nil {
 		return err
 	}
-	return writeAtomic(s.pendingPath(key), pending{Text: text, Created: now})
+	return writeAtomic(s.pendingPath(key), p)
 }
 
-// TakePending returns and deletes a parked text; expired or missing → false.
-func (s *Store) TakePending(key string, now time.Time, maxAge time.Duration) (string, bool) {
+// TakePending returns and deletes a parked text. A missing one returns the
+// zero record and false; an expired one is deleted too and returned with
+// false, so the caller can still tidy up after it (the reaction on the
+// owner's note).
+func (s *Store) TakePending(key string, now time.Time, maxAge time.Duration) (Parked, bool) {
 	path := s.pendingPath(key)
 	release, err := lockFile(context.Background(), filepath.Join(s.Dir, "pending.lock"))
 	if err != nil {
-		return "", false
+		return Parked{}, false
 	}
 	defer release()
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return "", false
+		return Parked{}, false
 	}
 	// Hand the text out only once it can never be handed out again.
 	if err := os.Remove(path); err != nil {
-		return "", false
+		return Parked{}, false
 	}
-	var p pending
-	if json.Unmarshal(b, &p) != nil || now.Sub(p.Created) > maxAge {
-		return "", false
+	var p Parked
+	if json.Unmarshal(b, &p) != nil {
+		return Parked{}, false
 	}
-	return p.Text, true
+	return p, now.Sub(p.Created) <= maxAge
 }
 
 // FindSessionByMessageID returns the session that sent the Telegram message.

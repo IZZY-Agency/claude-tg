@@ -507,8 +507,11 @@ func TestPickerIsNeverAPermissionDialog(t *testing.T) {
 // Bash dialog, "Do you want to proceed?" over a numbered option with the
 // "Esc to cancel · Tab to amend" footer, with no picker on screen and no
 // plan marker anywhere in the read. Its signature is PermissionSignature's.
+// The /approve and /deny fallback types only into the dialogs BashDialog
+// accepts: the Bash and Read ones, and an MCP tool's, which shares their
+// layout (Claude Code 2.1.310, mcp-dialog.txt; ruling P17).
 func TestBashDialog(t *testing.T) {
-	for _, name := range []string{"permission-screen.txt", "bash-gutter-100.txt", "bash-gutter-86.txt", "bash-heredoc-dialog.txt", "read-outside-dialog.txt"} {
+	for _, name := range []string{"permission-screen.txt", "bash-gutter-100.txt", "bash-gutter-86.txt", "bash-heredoc-dialog.txt", "read-outside-dialog.txt", "mcp-dialog.txt", "mcp-multiarg-dialog.txt"} {
 		s := screen(t, name)
 		if sig := BashDialog(s); sig == "" || sig != PermissionSignature(s) {
 			t.Errorf("%s: BashDialog = %q, want PermissionSignature %q", name, sig, PermissionSignature(s))
@@ -526,6 +529,8 @@ func TestBashDialog(t *testing.T) {
 		"plan": screen(t, "plan-approval.txt"), "picker": screen(t, "picker-single.txt"), "idle": screen(t, "idle-screen.txt"),
 		"picker asking to proceed": pickerAskingToProceed(t), "no footer": noFooter, "plan option in the scrollback": planAbove,
 		"plan question in the command": planQuoted, "edit showing the Bash lines": edit,
+		// Its signature would be only its question (ruling P26).
+		"top above the read": bash[strings.Index(bash, "\n Bash command\n")+len("\n Bash command\n"):],
 	} {
 		if noFooter == bash || planAbove == bash || planQuoted == bash || edit == screen(t, "edit-dialog.txt") {
 			t.Fatal("test screen not changed")
@@ -778,5 +783,111 @@ func TestPickerMarkers(t *testing.T) {
 		if PickerMarkers(s) {
 			t.Errorf("%s: picker marks found", name)
 		}
+	}
+}
+
+// Claude Code 2.1.310 draws an MCP tool's dialog like any other: a title
+// ending "Tool: (MCP)", the arguments as `name: { key: "value" }` between
+// two rules, the question, the options.
+func TestPermissionDialogMCP(t *testing.T) {
+	sig, whole := PermissionDialog(screen(t, "mcp-dialog.txt"))
+	if sig == "" || !whole {
+		t.Fatalf("sig=%q whole=%v, want a whole permission dialog", sig, whole)
+	}
+	for _, want := range []string{"(MCP)", `"Paris, France`, "Do you want to proceed?"} {
+		if !SignatureHas(sig, want) {
+			t.Errorf("signature %q lacks %q", sig, want)
+		}
+	}
+	if SignatureHas(sig, `"Lyon`) || SignatureHas(sig, "1. Yes") {
+		t.Errorf("signature %q shows what it should not", sig)
+	}
+	// Several arguments of one object print inline, comma-separated
+	// (the AccuWeather daily forecast).
+	sig, whole = PermissionDialog(screen(t, "mcp-multiarg-dialog.txt"))
+	if !whole || !strings.Contains(sig, `─queryParams:{locationKey:"2608456",unit:"metric",lang:"en"}─`) {
+		t.Errorf("sig=%q whole=%v, want the inline arguments between two rules", sig, whole)
+	}
+}
+
+// Parallel MCP calls wait on one dialog: Claude Code 2.1.310 shows the
+// first call not yet answered and right-aligns a counter on the title line,
+// the calls answered plus one, of all of them (mcp-queue-*.txt, captured
+// live 2026-10-26). The counter is progress, not the call shown: a call
+// behind the dialog answered by its hook moves it while the dialog stays
+// (mcp-queue-1of3.txt and mcp-queue-2of3.txt show the same call). The
+// signature leaves the counter out, so neither a call joining the queue
+// nor one behind it answered reads as the dialog answered.
+func TestPermissionDialogQueue(t *testing.T) {
+	sig := func(name, s string) string {
+		t.Helper()
+		got, whole := PermissionDialog(s)
+		if got == "" || !whole {
+			t.Fatalf("%s: sig=%q whole=%v, want a whole permission dialog", name, got, whole)
+		}
+		return got
+	}
+	first := screen(t, "mcp-queue-1of2.txt")
+	alone := strings.Replace(first, "1 of 2", "      ", 1)
+	if alone == first {
+		t.Fatal("fixture lacks its counter")
+	}
+	if a, b := sig("alone", alone), sig("1 of 2", first); a != b {
+		t.Errorf("a call joining the queue changed the signature:\n%q\n%q", a, b)
+	}
+	if a, b := sig("1 of 3", screen(t, "mcp-queue-1of3.txt")), sig("2 of 3", screen(t, "mcp-queue-2of3.txt")); a != b {
+		t.Errorf("a call behind the dialog answered changed the signature:\n%q\n%q", a, b)
+	}
+	next := sig("2 of 2", screen(t, "mcp-queue-2of2.txt"))
+	if next == sig("1 of 2", first) {
+		t.Error("two calls of one queue share a signature")
+	}
+	for _, s := range []string{sig("1 of 2", first), next} {
+		if strings.Contains(s, "of2") || !strings.HasPrefix(s, "Tooluse") {
+			t.Errorf("signature %q keeps the counter or loses the title", s)
+		}
+	}
+	// The relay's fallback types only when two reads show the same call at
+	// the same place in the queue (ruling P26): an answer at the Mac
+	// between them can bring up an identical call.
+	identical := strings.Replace(first, "1 of 2", "2 of 2", 1)
+	if b := BashDialog(first); b == "" || b == BashDialog(alone) || b == BashDialog(identical) {
+		t.Error("BashDialog leaves the counter out")
+	}
+	if BashDialog(alone) != PermissionSignature(alone) {
+		t.Error("BashDialog of a dialog without a counter is not its signature")
+	}
+}
+
+// DialogQueued: the dialog shown has calls queued behind it, still to be
+// answered, while its counter's first number is below its second.
+func TestDialogQueued(t *testing.T) {
+	last := strings.Replace(screen(t, "mcp-queue-2of3.txt"), "2 of 3", "3 of 3", 1)
+	for name, c := range map[string]struct {
+		s    string
+		want bool
+	}{
+		"1 of 2":              {screen(t, "mcp-queue-1of2.txt"), true},
+		"1 of 3":              {screen(t, "mcp-queue-1of3.txt"), true},
+		"2 of 3":              {screen(t, "mcp-queue-2of3.txt"), true},
+		"2 of 2, the last":    {screen(t, "mcp-queue-2of2.txt"), false},
+		"3 of 3, the last":    {last, false},
+		"one call":            {screen(t, "mcp-dialog.txt"), false},
+		"bash":                {screen(t, "permission-screen.txt"), false},
+		"idle":                {screen(t, "idle-screen.txt"), false},
+		"picker":              {screen(t, "picker-single.txt"), false},
+		"plan":                {screen(t, "plan-approval.txt"), false},
+		"counter in the args": {strings.Replace(screen(t, "mcp-dialog.txt"), `query: "Paris, France" }`, `query: "Paris" }    1 of 2`, 1), false},
+	} {
+		if got := DialogQueued(c.s); got != c.want {
+			t.Errorf("%s: DialogQueued = %v, want %v", name, got, c.want)
+		}
+	}
+	// The counter's line must be the dialog's own title line, under its
+	// top border in the read.
+	cut := screen(t, "mcp-queue-1of2.txt")
+	cut = cut[strings.Index(cut, "\n AccuWeather® — Current Weather Tool")+1:]
+	if DialogQueued(cut) {
+		t.Error("a dialog whose title is above the read reads as queued")
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -754,4 +755,44 @@ func TestTakeBackAnswerWaitsWithinItsContext(t *testing.T) {
 	if sess, _ := s.LoadSession("s"); sess.Owed() != 0 {
 		t.Fatalf("owed %d, want 0", sess.Owed())
 	}
+}
+
+// DropVoiceMark drops only the ask's voice mark, never its credit or
+// another mark, under the session's lock, waiting for that lock only as
+// long as its context allows; running it again changes nothing.
+func TestDropVoiceMarkKeepsTheCredit(t *testing.T) {
+	s := open(t)
+	at := time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)
+	if _, err := s.UpdateSession("s", func(sess *Session) {
+		sess.ArmAsk("a1")
+		sess.MarkVoice("a1", "", at)
+		sess.MarkVoice("", "", at.Add(time.Minute))
+		sess.ArmAsk("a2")
+		sess.MarkVoice("a2", "", at.Add(2*time.Minute))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := s.DropVoiceMark(context.Background(), "s", "a1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sess, err := s.LoadSession("s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(sess.AskCredits, []string{"a1", "a2"}) || !sameMarks(sess.VoiceMarks, []VoiceMark{{At: at.Add(time.Minute)}, {At: at.Add(2 * time.Minute), AskID: "a2"}}) {
+		t.Fatalf("credits %q marks %+v, want both credits and a1's mark gone", sess.AskCredits, sess.VoiceMarks)
+	}
+	release := holdSession(t, s, "s")
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if err := s.DropVoiceMark(ctx, "s", "a2"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v, want a timeout", err)
+	}
+	if took := time.Since(start); took > 500*time.Millisecond {
+		t.Fatalf("waited %s for the session lock", took)
+	}
+	release()
 }

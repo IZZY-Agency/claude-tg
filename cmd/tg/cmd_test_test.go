@@ -5,8 +5,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/IZZY-Agency/claude-tg/internal/state"
 )
 
 func isolate(t *testing.T) string {
@@ -26,6 +30,22 @@ func writeConfig(t *testing.T, dir string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"bot_token":"1:x","chat_id":1,"away_after_seconds":0}`), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Every message tg sends from the command line scrubs the configured
+// secrets: the bot token and the TypeSafe key.
+func TestNewAppSenderSecrets(t *testing.T) {
+	dir := isolate(t)
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"bot_token":"1:x","chat_id":1,"typesafe_api_key":"k-secret-123"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a, code := newApp(&cli{stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard, env: os.Getenv})
+	if code != exitOK {
+		t.Fatalf("code=%d", code)
+	}
+	if want := []string{"1:x", "k-secret-123"}; !slices.Equal(a.sender.Secrets, want) {
+		t.Fatalf("sender secrets: %d of them, want the bot token and the key", len(a.sender.Secrets))
 	}
 }
 
@@ -116,6 +136,43 @@ func TestLogPrintsTail(t *testing.T) {
 	var out bytes.Buffer
 	if code := run([]string{"log", "-n", "2"}, strings.NewReader(""), &out, io.Discard); code != 0 || out.String() != "l2\nl3\n" {
 		t.Fatalf("code=%d out=%q", code, out.String())
+	}
+}
+
+// tg follow off forgets the session's voice marks in the same write: a
+// mark made while it was followed must not make the answer to a later
+// typed swipe-reply spoken. tg follow on keeps them.
+func TestFollowOffClearsVoiceMarks(t *testing.T) {
+	const sid = "6449d606-55c1-4e6d-a915-4b14c777f57f"
+	calls := speakSetup(t, "")
+	store, err := state.Open(os.Getenv("TG_STATE_DIR"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A freshly resolved name: tg follow never runs `claude agents`.
+	s := &state.Session{SessionID: sid, Name: "acme-shop-92", NameResolvedAt: time.Now()}
+	s.MarkVoice("", "", time.Now())
+	if err := store.SaveSession(s); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []struct {
+		action string
+		marks  int
+	}{{"on", 1}, {"off", 0}} {
+		var out, errb bytes.Buffer
+		if code := run([]string{"follow", step.action, "--session", sid}, strings.NewReader(""), &out, &errb); code != exitOK {
+			t.Fatalf("follow %s: code=%d err=%q", step.action, code, errb.String())
+		}
+		after, err := store.LoadSession(sid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.Follow != (step.action == "on") || len(after.VoiceMarks) != step.marks {
+			t.Fatalf("follow %s: follow=%v marks=%+v, want %d marks", step.action, after.Follow, after.VoiceMarks, step.marks)
+		}
+	}
+	if got := calls(); len(got) != 2 || got[0].method != "sendMessage" {
+		t.Fatalf("confirmations = %+v", got)
 	}
 }
 

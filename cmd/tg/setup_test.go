@@ -3,12 +3,16 @@ package main
 import (
 	"bytes"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/IZZY-Agency/claude-tg/internal/assets"
+	"github.com/IZZY-Agency/claude-tg/internal/config"
 	"github.com/IZZY-Agency/claude-tg/internal/settings"
 )
 
@@ -86,7 +90,7 @@ func TestSetupNoTTYNoChatIDExits1(t *testing.T) {
 	claudeHome(t)
 	var errb bytes.Buffer
 	code := run([]string{"setup", "--token", "1:x", "--yes"}, strings.NewReader(""), io.Discard, &errb)
-	if code != 1 || !strings.Contains(errb.String(), "--chat-id") {
+	if code != exitUsage || !strings.Contains(errb.String(), "--chat-id") {
 		t.Fatalf("code=%d stderr=%q", code, errb.String())
 	}
 }
@@ -258,5 +262,279 @@ func TestSetupCheckOutdatedLineHasNoDoubleSpace(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "hooks: 0/6 installed") {
 		t.Fatalf("count wrong:\n%s", out.String())
+	}
+}
+
+// A re-run of `tg setup` rebuilds the config; the owner's voice_command must
+// survive it.
+func TestSetupKeepsVoiceCommand(t *testing.T) {
+	existing := &config.Config{AwayAfterSeconds: 30, VoiceCommand: "transcribe-it", SpeechCommand: "speak-it"}
+	cfg := &config.Config{AwayAfterSeconds: config.DefaultAwayAfterSeconds, InstalledAt: time.Now()}
+	carryOver(cfg, existing)
+	if cfg.VoiceCommand != "transcribe-it" || cfg.SpeechCommand != "speak-it" || cfg.AwayAfterSeconds != 30 {
+		t.Fatalf("carryOver lost fields: %+v", cfg)
+	}
+	before := *cfg
+	carryOver(cfg, nil)
+	if *cfg != before {
+		t.Fatalf("carryOver(cfg, nil) changed the config: %+v", cfg)
+	}
+}
+
+func TestSetupCheckVoiceLine(t *testing.T) {
+	for _, tc := range []struct{ cfg, want string }{
+		{`{"bot_token":"1:x","chat_id":1,"voice_command":"cat x"}`, "voice: configured\n"},
+		{`{"bot_token":"1:x","chat_id":1,"speech_command":"say x"}`, "voice: not configured (see the README)\nspeech: configured\n"},
+		{`{"bot_token":"1:x","chat_id":1}`, "voice: not configured (see the README)\nspeech: not configured (see the README)\n"},
+	} {
+		dir := isolate(t)
+		claudeHome(t)
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(tc.cfg), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var out bytes.Buffer
+		if code := run([]string{"setup", "--check"}, strings.NewReader(""), &out, io.Discard); code != 0 {
+			t.Fatalf("code=%d out=%s", code, out.String())
+		}
+		o := out.String()
+		i, j := strings.Index(o, "relay:"), strings.Index(o, tc.want)
+		if i < 0 || j < i {
+			t.Fatalf("want %q after the relay line:\n%s", tc.want, o)
+		}
+	}
+}
+
+// fakeTelegramForSetup answers getMe and sendMessage so a full non-interactive
+// setup runs without the network.
+func fakeTelegramForSetup(t *testing.T) {
+	t.Helper()
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"ok":true,"result":{"id":7,"username":"fakebot","message_id":1,"date":1,"chat":{"id":1}}}`)
+	}))
+	t.Cleanup(s.Close)
+	old := setupTelegramBaseURL
+	setupTelegramBaseURL = s.URL
+	t.Cleanup(func() { setupTelegramBaseURL = old })
+}
+
+func runSetupKey(t *testing.T, args ...string) (string, string, int) {
+	t.Helper()
+	var out, errb bytes.Buffer
+	code := run(append([]string{"setup", "--token", "1:x", "--chat-id", "1", "--yes", "--no-claude-md"}, args...), strings.NewReader(""), &out, &errb)
+	return out.String(), errb.String(), code
+}
+
+func savedKey(t *testing.T, dir string) string {
+	t.Helper()
+	cfg, err := config.Load(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg.TypesafeAPIKey
+}
+
+func modelsServer(t *testing.T, status int) {
+	t.Helper()
+	fakeTypesafe(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Errorf("unexpected request %s", r.URL.Path)
+		}
+		w.WriteHeader(status)
+		io.WriteString(w, `{"data":[]}`)
+	})
+}
+
+func TestSetupTypesafeKeyFromFlag(t *testing.T) {
+	dir := isolate(t)
+	claudeHome(t)
+	fakeTelegramForSetup(t)
+	modelsServer(t, 200)
+	out, errb, code := runSetupKey(t, "--typesafe-key", "k-1")
+	if code != 0 || !strings.Contains(out, "TypeSafe: key accepted\n") {
+		t.Fatalf("code=%d out=%s err=%s", code, out, errb)
+	}
+	if savedKey(t, dir) != "k-1" {
+		t.Fatalf("saved %q", savedKey(t, dir))
+	}
+	if strings.Contains(out+errb, "k-1") {
+		t.Fatalf("the key was printed:\n%s%s", out, errb)
+	}
+}
+
+func TestSetupTypesafeKeyRejected(t *testing.T) {
+	dir := isolate(t)
+	claudeHome(t)
+	fakeTelegramForSetup(t)
+	modelsServer(t, 401)
+	out, _, code := runSetupKey(t, "--typesafe-key", "k-bad")
+	if code != 0 || !strings.Contains(out, "TypeSafe: key rejected; not saved\n") || savedKey(t, dir) != "" {
+		t.Fatalf("code=%d out=%s saved=%q", code, out, savedKey(t, dir))
+	}
+}
+
+func TestSetupTypesafeKeyUnchecked(t *testing.T) {
+	dir := isolate(t)
+	claudeHome(t)
+	fakeTelegramForSetup(t)
+	s := httptest.NewServer(http.NotFoundHandler())
+	url := s.URL
+	s.Close() // nothing listens any more
+	old := classifyBaseURL
+	classifyBaseURL = url
+	t.Cleanup(func() { classifyBaseURL = old })
+	out, errb, code := runSetupKey(t, "--typesafe-key", "k-4")
+	if code != 0 || !strings.Contains(out, "TypeSafe: could not check the key (") || !strings.Contains(out, "); saved anyway\n") {
+		t.Fatalf("code=%d out=%s err=%s", code, out, errb)
+	}
+	if savedKey(t, dir) != "k-4" || strings.Contains(out+errb, "k-4") {
+		t.Fatalf("saved=%q out=%s", savedKey(t, dir), out)
+	}
+}
+
+func TestSetupTypesafeKeyFromEnv(t *testing.T) {
+	dir := isolate(t)
+	claudeHome(t)
+	fakeTelegramForSetup(t)
+	modelsServer(t, 200)
+	t.Setenv("TYPESAFE_API_KEY", "key-env-2")
+	out, _, code := runSetupKey(t)
+	if code != 0 || savedKey(t, dir) != "key-env-2" || strings.Contains(out, "key-env-2") {
+		t.Fatalf("code=%d saved=%q out=%s", code, savedKey(t, dir), out)
+	}
+}
+
+func TestSetupYesKeepsTypesafeKey(t *testing.T) {
+	dir := isolate(t)
+	claudeHome(t)
+	fakeTelegramForSetup(t)
+	modelsServer(t, 200)
+	t.Setenv("TYPESAFE_API_KEY", "")
+	writeKeyConfig(t, dir, "k-3")
+	out, _, code := runSetupKey(t)
+	if code != 0 || savedKey(t, dir) != "k-3" || strings.Contains(out, "TypeSafe API key for") {
+		t.Fatalf("code=%d saved=%q out=%s", code, savedKey(t, dir), out)
+	}
+}
+
+func TestSetupWithoutKeySavesNone(t *testing.T) {
+	dir := isolate(t)
+	claudeHome(t)
+	fakeTelegramForSetup(t)
+	t.Setenv("TYPESAFE_API_KEY", "")
+	out, _, code := runSetupKey(t)
+	if code != 0 || savedKey(t, dir) != "" || strings.Contains(out, "TypeSafe") {
+		t.Fatalf("code=%d out=%s", code, out)
+	}
+}
+
+func TestSetupCheckClassifierLine(t *testing.T) {
+	for _, tc := range []struct{ cfg, want string }{
+		{`{"bot_token":"1:x","chat_id":1,"typesafe_api_key":"k"}`, "speech: not configured (see the README)\nclassifier: configured (TypeSafe), unused until speech_command is set\n"},
+		{`{"bot_token":"1:x","chat_id":1,"typesafe_api_key":"k","speech_command":"say x"}`, "speech: configured\nclassifier: configured (TypeSafe)\n"},
+		{`{"bot_token":"1:x","chat_id":1}`, "speech: not configured (see the README)\nclassifier: not configured (typed answers are never spoken)\n"},
+	} {
+		dir := isolate(t)
+		claudeHome(t)
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(tc.cfg), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var out bytes.Buffer
+		if code := run([]string{"setup", "--check"}, strings.NewReader(""), &out, io.Discard); code != 0 || !strings.Contains(out.String(), tc.want) {
+			t.Fatalf("code=%d want %q in:\n%s", code, tc.want, out.String())
+		}
+	}
+}
+
+func TestChooseTypesafeKey(t *testing.T) {
+	asked, prompted := 0, 0
+	for _, tc := range []struct {
+		name                 string
+		flag, env, cfg       string
+		tty, yes, reuse      bool
+		typed, want          string
+		wantAsked, wantPromp int
+	}{
+		{"flag wins", "f", "e", "c", true, false, true, "", "f", 0, 0},
+		{"env over config", "", "e", "c", true, false, true, "", "e", 0, 0},
+		{"tty reuse yes keeps", "", "", "c", true, false, true, "typed", "c", 1, 0},
+		{"tty reuse no prompts", "", "", "c", true, false, false, "new", "new", 1, 1},
+		{"tty reuse no, Enter keeps none", "", "", "c", true, false, false, "", "", 1, 1},
+		{"tty no key prompts", "", "", "", true, false, false, "new", "new", 0, 1},
+		{"tty no key, Enter skips", "", "", "", true, false, false, "", "", 0, 1},
+		{"yes keeps existing, no prompt", "", "", "c", true, true, false, "typed", "c", 0, 0},
+		{"yes with no key never prompts", "", "", "", true, true, false, "typed", "", 0, 0},
+		{"no tty keeps existing", "", "", "c", false, false, false, "typed", "c", 0, 0},
+		{"no tty no key", "", "", "", false, false, false, "typed", "", 0, 0},
+	} {
+		asked, prompted = 0, 0
+		got := chooseTypesafeKey(tc.flag, tc.env, tc.cfg, tc.tty, tc.yes,
+			func() bool { asked++; return tc.reuse },
+			func() string { prompted++; return tc.typed })
+		if got != tc.want || asked != tc.wantAsked || prompted != tc.wantPromp {
+			t.Errorf("%s: got %q asked=%d prompted=%d, want %q %d %d", tc.name, got, asked, prompted, tc.want, tc.wantAsked, tc.wantPromp)
+		}
+	}
+}
+
+func TestSetupRejectedExistingKeyIsDropped(t *testing.T) {
+	dir := isolate(t)
+	claudeHome(t)
+	fakeTelegramForSetup(t)
+	modelsServer(t, 401)
+	t.Setenv("TYPESAFE_API_KEY", "")
+	writeKeyConfig(t, dir, "k-old-7")
+	out, _, code := runSetupKey(t)
+	if code != 0 || !strings.Contains(out, "TypeSafe: key rejected; not saved\n") || savedKey(t, dir) != "" {
+		t.Fatalf("code=%d saved=%q out=%s", code, savedKey(t, dir), out)
+	}
+}
+
+func TestSetupKeyWithoutSpeechCommandSaysSo(t *testing.T) {
+	const note = "TypeSafe: used once speech_command is set (see the README)\n"
+	dir := isolate(t)
+	claudeHome(t)
+	fakeTelegramForSetup(t)
+	modelsServer(t, 200)
+	out, _, code := runSetupKey(t, "--typesafe-key", "k-9")
+	if code != 0 || !strings.Contains(out, "TypeSafe: key accepted\n"+note) {
+		t.Fatalf("code=%d out=%s", code, out)
+	}
+	// With a speech command already configured the note is not printed.
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"bot_token":"1:x","chat_id":1,"speech_command":"say x"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, _, code = runSetupKey(t, "--typesafe-key", "k-9")
+	if code != 0 || !strings.Contains(out, "key accepted") || strings.Contains(out, "used once speech_command") {
+		t.Fatalf("code=%d out=%s", code, out)
+	}
+}
+
+func TestSetupTrimsKeyFromFlagAndEnv(t *testing.T) {
+	dir := isolate(t)
+	claudeHome(t)
+	fakeTelegramForSetup(t)
+	modelsServer(t, 200)
+	if _, _, code := runSetupKey(t, "--typesafe-key", "k-flag \n"); code != 0 || savedKey(t, dir) != "k-flag" {
+		t.Fatalf("code=%d saved=%q", code, savedKey(t, dir))
+	}
+	t.Setenv("TYPESAFE_API_KEY", " k-env\n")
+	if _, _, code := runSetupKey(t); code != 0 || savedKey(t, dir) != "k-env" {
+		t.Fatalf("code=%d saved=%q", code, savedKey(t, dir))
+	}
+}
+
+func TestSetupUncheckedLineNamesTypesafeOnce(t *testing.T) {
+	isolate(t)
+	claudeHome(t)
+	fakeTelegramForSetup(t)
+	s := httptest.NewServer(http.NotFoundHandler())
+	url := s.URL
+	s.Close()
+	old := classifyBaseURL
+	classifyBaseURL = url
+	t.Cleanup(func() { classifyBaseURL = old })
+	out, _, _ := runSetupKey(t, "--typesafe-key", "k-5")
+	if !strings.Contains(out, "TypeSafe: could not check the key (") || strings.Contains(out, "typesafe: ") {
+		t.Fatalf("out=%s", out)
 	}
 }

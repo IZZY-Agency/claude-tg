@@ -12,10 +12,14 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/IZZY-Agency/claude-tg/internal/classify"
+	"github.com/IZZY-Agency/claude-tg/internal/config"
 	"github.com/IZZY-Agency/claude-tg/internal/hooks"
 	"github.com/IZZY-Agency/claude-tg/internal/idle"
 	"github.com/IZZY-Agency/claude-tg/internal/session"
@@ -369,5 +373,258 @@ func TestHookEditFallsBackToPlainText(t *testing.T) {
 	}
 	if _, ok := plain["parse_mode"]; ok || plain["text"] != "🔐 acme\nneeds permission: Bash: mysql --password=[redacted]\n\nanswered at the Mac" || plain["reply_markup"] != nil || plain["message_id"] != float64(7) {
 		t.Fatalf("plain edit=%+v", plain)
+	}
+}
+
+// The stop hook's budget covers the speech command's 30 s, the voice
+// upload and the text's reserve (hookTimeout) when speech_command is set;
+// without it the budget is the one every hook had.
+func TestStopBudget(t *testing.T) {
+	if got := stopBudget(&config.Config{}); got != 15*time.Second {
+		t.Fatalf("without speech_command: %s, want 15s", got)
+	}
+	got := stopBudget(&config.Config{SpeechCommand: copyFixture})
+	if got != 60*time.Second {
+		t.Fatalf("with speech_command: %s, want 1m0s", got)
+	}
+	speechTimeout := speechRunner(&cli{env: os.Getenv}, copyFixture).Timeout
+	if got-stopTextReserve <= speechTimeout || stopTextReserve != hookTimeout {
+		t.Fatalf("budget %s, text reserve %s: no room for the speech command's %s", got, stopTextReserve, speechTimeout)
+	}
+}
+
+const stopPayload = `{"session_id":"6449d606-55c1-4e6d-a915-4b14c777f57f","cwd":"/Users/alex/code/acme-shop","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"Готово, тесты прошли."}`
+
+// The stop hook asks TypeSafe only with both a key and a speech command:
+// without speech there is nothing to choose, and without a key the 0.4.0
+// rule stands.
+func TestHookWiresClassifierOnlyWithKeyAndSpeech(t *testing.T) {
+	for _, tc := range []struct {
+		name, key, speech string
+		wired             bool
+	}{
+		{"key and speech_command", "k-secret-123", copyFixture, true},
+		{"key only", "k-secret-123", "", false},
+		{"speech_command only", "", copyFixture, false},
+		{"neither", "", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := isolate(t)
+			cfg := map[string]any{"bot_token": "1:x", "chat_id": 1}
+			if tc.key != "" {
+				cfg["typesafe_api_key"] = tc.key
+			}
+			if tc.speech != "" {
+				cfg["speech_command"] = tc.speech
+			}
+			raw, err := json.Marshal(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "config.json"), raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			orig := handleFn
+			t.Cleanup(func() { handleFn = orig })
+			var got []hooks.Classifier
+			handleFn = func(_ context.Context, kind string, _ *hooks.Input, d hooks.Deps) error {
+				if kind == "stop" {
+					got = append(got, d.Classifier)
+				}
+				return nil
+			}
+			if code := run([]string{"hook", "stop"}, strings.NewReader(stopPayload), io.Discard, io.Discard); code != 0 {
+				t.Fatalf("code=%d", code)
+			}
+			if len(got) != 1 {
+				t.Fatalf("stop hook ran %d times, want once", len(got))
+			}
+			c, ok := got[0].(*classify.Client)
+			switch {
+			case tc.wired && (!ok || c == nil || c.Key != tc.key || c.BaseURL != ""):
+				t.Fatalf("Classifier=%T (key matches: %v), want a *classify.Client with the configured key and the default URL", got[0], ok && c != nil && c.Key == tc.key)
+			case !tc.wired && got[0] != nil:
+				t.Fatalf("Classifier=%T, want nil", got[0])
+			}
+		})
+	}
+}
+
+// A hook's 💬 message never shows the TypeSafe key, not even in the JSON
+// form of the config, which credential redaction alone misses: the key is
+// one of the sender's secrets, as the bot token is.
+func TestHookStopRedactsTypesafeKey(t *testing.T) {
+	const sid = "6449d606-55c1-4e6d-a915-4b14c777f57f"
+	const key = "tsk-7Hq2mVx9LpR4wZ"
+	dir := isolate(t)
+	noPane(t)
+	raw, err := json.Marshal(map[string]any{"bot_token": "1:x", "chat_id": 1, "typesafe_api_key": key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var texts []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Text string `json:"text"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		texts = append(texts, body.Text)
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":42}}`))
+	}))
+	defer srv.Close()
+	orig := hookClient
+	t.Cleanup(func() { hookClient = orig })
+	hookClient = func(token string) *telegram.Client {
+		return &telegram.Client{Token: token, HTTP: srv.Client(), BaseURL: srv.URL}
+	}
+	store, err := state.Open(filepath.Join(dir, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Followed, with a freshly resolved name: the hook never runs `claude agents`.
+	if err := store.SaveSession(&state.Session{SessionID: sid, Name: "acme-shop-92", NameResolvedAt: time.Now(), Follow: true}); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"session_id": sid, "cwd": "/Users/alex/code/acme-shop", "hook_event_name": "Stop",
+		"last_assistant_message": "The config holds:\n\n\"typesafe_api_key\": \"" + key + "\"",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := run([]string{"hook", "stop"}, bytes.NewReader(payload), io.Discard, io.Discard); code != 0 {
+		t.Fatalf("code=%d", code)
+	}
+	if len(texts) != 1 || !strings.HasPrefix(texts[0], "💬 <b>acme-shop-92</b>") || !strings.Contains(texts[0], "[redacted]") || strings.Contains(texts[0], key) {
+		t.Fatalf("sent %q, want one 💬 message with the key redacted", texts)
+	}
+}
+
+// tg hook stop speaks a short answer owed to a voice note with the
+// configured speech_command, then sends the text; without speech_command
+// the answer is text only and the mark is spent all the same.
+func TestHookStopSpeaksWithSpeechCommand(t *testing.T) {
+	const sid = "6449d606-55c1-4e6d-a915-4b14c777f57f"
+	for _, tc := range []struct {
+		name, command string
+		want          []string
+	}{
+		{"speech_command", copyFixture, []string{"sendVoice", "sendMessage"}},
+		{"no speech_command", "", []string{"sendMessage"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := speakSetup(t, tc.command)
+			noPane(t)
+			dir := os.Getenv("TG_STATE_DIR")
+			store, err := state.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A freshly resolved name: the hook never runs `claude agents`.
+			s := &state.Session{SessionID: sid, Name: "acme-shop-92", NameResolvedAt: time.Now(), PendingAnswers: 1}
+			s.MarkVoice("", "", time.Now())
+			if err := store.SaveSession(s); err != nil {
+				t.Fatal(err)
+			}
+			if code := run([]string{"hook", "stop"}, strings.NewReader(stopPayload), io.Discard, io.Discard); code != 0 {
+				t.Fatalf("code=%d", code)
+			}
+			got := calls()
+			var methods []string
+			for _, c := range got {
+				methods = append(methods, c.method)
+			}
+			if strings.Join(methods, " ") != strings.Join(tc.want, " ") {
+				t.Fatalf("requests=%v, want %v", methods, tc.want)
+			}
+			log, _ := os.ReadFile(filepath.Join(dir, "tg.log"))
+			if tc.command != "" {
+				v := got[0]
+				if v.fields["caption"] != "🔊 acme-shop-92" || v.fields["disable_notification"] != "true" || v.audio == 0 {
+					t.Fatalf("voice=%+v", v)
+				}
+				if !strings.Contains(string(log), "spoke 21 characters (") {
+					t.Fatalf("log lacks the spoken line:\n%s", log)
+				}
+			}
+			after, err := store.LoadSession(sid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(after.VoiceMarks) != 0 || after.PendingAnswers != 0 {
+				t.Fatalf("mark or answer not spent: %+v", after)
+			}
+			left, _ := filepath.Glob(filepath.Join(dir, "voice", "speech-*"))
+			if len(left) != 0 {
+				t.Fatalf("speech dirs left behind: %v", left)
+			}
+		})
+	}
+}
+
+// A signal to the stop hook while it speaks (the terminal closing, say)
+// ends the speech: the command's process group, which the signal does not
+// reach, is killed rather than orphaned, and the text still goes out. The
+// signal goes to this test process, so this test must stay sequential
+// (see TestSpeakInterrupted).
+func TestHookStopSignalEndsSpeech(t *testing.T) {
+	const sid = "6449d606-55c1-4e6d-a915-4b14c777f57f"
+	calls := speakSetup(t, `echo $$ > "$TG_TEST_PIDFILE"; sleep 33.2719`)
+	noPane(t)
+	pidFile := filepath.Join(t.TempDir(), "speech.pid")
+	t.Setenv("TG_TEST_PIDFILE", pidFile)
+	dir := os.Getenv("TG_STATE_DIR")
+	store, err := state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &state.Session{SessionID: sid, Name: "acme-shop-92", NameResolvedAt: time.Now(), PendingAnswers: 1}
+	s.MarkVoice("", "", time.Now())
+	if err := store.SaveSession(s); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan int, 1)
+	go func() { done <- run([]string{"hook", "stop"}, strings.NewReader(stopPayload), io.Discard, io.Discard) }()
+	var pid int
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if b, _ := os.ReadFile(pidFile); bytes.HasSuffix(b, []byte("\n")) {
+			if pid, err = strconv.Atoi(strings.TrimSpace(string(b))); err != nil || pid <= 0 {
+				t.Fatalf("pid file %q: %v", b, err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the speech command never started")
+		}
+	}
+	t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL) })
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("code=%d", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stop hook did not end its speech on the signal")
+	}
+	if syscall.Kill(pid, 0) == nil {
+		t.Fatalf("the speech command %d outlived the signal", pid)
+	}
+	var methods []string
+	for _, c := range calls() {
+		methods = append(methods, c.method)
+	}
+	if strings.Join(methods, " ") != "sendMessage" {
+		t.Fatalf("requests=%v, want the text only", methods)
+	}
+	log, _ := os.ReadFile(filepath.Join(dir, "tg.log"))
+	if !strings.Contains(string(log), "speech: context canceled") {
+		t.Fatalf("log lacks the ended speech:\n%s", log)
 	}
 }

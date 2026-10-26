@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -46,9 +47,14 @@ func TestPartitionStale(t *testing.T) {
 		{UpdateID: 3, CallbackQuery: &telegram.CallbackQuery{Message: &telegram.Message{Date: now.Add(-20 * time.Minute).Unix()}}},
 		// An ask tap carries only its message's date, not when it was tapped.
 		{UpdateID: 4, CallbackQuery: &telegram.CallbackQuery{Data: "a:0123456789abcdef:0:y", Message: &telegram.Message{Date: now.Add(-20 * time.Minute).Unix()}}},
+		// So does a voice confirmation's button and a session pick (R19).
+		{UpdateID: 5, CallbackQuery: &telegram.CallbackQuery{Data: "v:0a1b2c3d:y", Message: &telegram.Message{Date: now.Add(-20 * time.Minute).Unix()}}},
+		{UpdateID: 6, CallbackQuery: &telegram.CallbackQuery{Data: "s:" + sidShop + ":0a1b2c3d", Message: &telegram.Message{Date: now.Add(-20 * time.Minute).Unix()}}},
+		// And a button of /sessions, tapped long after the list was sent.
+		{UpdateID: 7, CallbackQuery: &telegram.CallbackQuery{Data: "p:" + sidShop, Message: &telegram.Message{Date: now.Add(-20 * time.Minute).Unix()}}},
 	}
 	fresh, stale := PartitionStale(ups, now, 10*time.Minute)
-	if len(fresh) != 2 || fresh[0].UpdateID != 2 || fresh[1].UpdateID != 4 || len(stale) != 2 {
+	if len(fresh) != 5 || fresh[0].UpdateID != 2 || fresh[1].UpdateID != 4 || fresh[2].UpdateID != 5 || fresh[3].UpdateID != 6 || fresh[4].UpdateID != 7 || len(stale) != 2 {
 		t.Fatalf("fresh=%+v stale=%+v", fresh, stale)
 	}
 }
@@ -286,22 +292,32 @@ func TestRunHonoursOldAskTapInSteadyState(t *testing.T) {
 }
 
 // A relay that kept running while the Mac slept must not type hours-old
-// text after wake: past the drain, old messages and old session picks are
-// still skipped.
+// text after wake: past the drain, old messages are still skipped. An old
+// session pick is not skipped (ruling R19): its parked text expired with
+// it, so the pick types nothing and says so.
 func TestRunSkipsOldMessageInSteadyState(t *testing.T) {
 	f := newFixture(t)
 	old := f.msg("ship it", 101)
 	old.UpdateID, old.Message.Date = 2, f.now.Add(-30*time.Minute).Unix()
+	if err := f.store.PutPending("deadbeef", state.Parked{Text: "please rerun", MessageID: 500, Created: f.now.Add(-30 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
 	pick := tapUpdate("s:"+sidShop+":deadbeef", 1001)
 	pick.UpdateID, pick.CallbackQuery.Message.Date = 3, f.now.Add(-30*time.Minute).Unix()
 	p := &fakePoller{batches: [][]telegram.Update{{}, {old, pick}}}
 	l := &Loop{Poll: p, Router: f.r, Store: f.store, MaxAge: 10 * time.Minute, Log: func(string, ...any) {}}
 	runPolls(t, l, p, 3)
-	if len(f.term.Typed) != 0 || len(f.api.Answers) != 0 || len(f.api.Reactions) != 0 {
-		t.Fatalf("an old update was handled: typed = %+v answers = %+v", f.term.Typed, f.api.Answers)
+	if len(f.term.Typed) != 0 || len(f.api.Reactions) != 0 {
+		t.Fatalf("an old update was delivered: typed = %+v reactions = %+v", f.term.Typed, f.api.Reactions)
 	}
-	if n := skippedNotices(f); n != 1 || !strings.Contains(f.api.LastText(), "skipped 2 message") {
-		t.Fatalf("want one notice for both old updates: %+v", f.api.Sent)
+	if got := f.toasts(); !reflect.DeepEqual(got, []string{"expired, send the text again"}) {
+		t.Fatalf("toasts = %q", got)
+	}
+	if len(f.api.Edits) != 1 || f.api.Edits[0].MessageID != 1001 || f.api.Edits[0].Text != "expired; send the text again" {
+		t.Fatalf("edits = %+v", f.api.Edits)
+	}
+	if n := skippedNotices(f); n != 1 || !strings.Contains(f.api.LastText(), "skipped 1 message") {
+		t.Fatalf("want one notice for the old message: %+v", f.api.Sent)
 	}
 }
 

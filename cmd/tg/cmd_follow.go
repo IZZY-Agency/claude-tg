@@ -40,6 +40,8 @@ func cmdFollow(c *cli, args []string) int {
 	if code != exitOK {
 		return code
 	}
+	// Reuse the hooks' client seam, so tests can point tg follow at a fake server.
+	a.sender.API = hookClient(a.cfg.BotToken)
 	sid := a.sessionID(*sessionFlag)
 	if sid == "" {
 		fmt.Fprintln(c.stderr, "tg follow: no session (run inside Claude Code or pass --session <id>)")
@@ -61,7 +63,8 @@ func cmdFollow(c *cli, args []string) int {
 		return exitOK
 	case "on", "off":
 		want := pos[0] == "on"
-		if _, err := a.store.UpdateSession(sess.SessionID, func(s *state.Session) { s.Follow = want }); err != nil {
+		// Off also forgets the session's voice marks (state.Session.SetFollow).
+		if _, err := a.store.UpdateSession(sess.SessionID, func(s *state.Session) { s.SetFollow(want) }); err != nil {
 			fmt.Fprintf(c.stderr, "tg follow: %v\n", err)
 			return 4
 		}

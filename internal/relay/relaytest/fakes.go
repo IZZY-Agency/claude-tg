@@ -24,7 +24,10 @@ type Edit struct {
 	Keyboard  [][]telegram.Button
 }
 
-// API records every Telegram call the router makes.
+// API records every Telegram call the router makes. Files are the files
+// GetFile and Download serve, keyed by file id, at the path Paths gives
+// for the id (default voice/<id>.oga); GetFile fails with FileErr when it
+// is set, and SendMessage with SendErr (recording nothing).
 type API struct {
 	mu        sync.Mutex
 	Sent      []telegram.SendRequest
@@ -32,19 +35,33 @@ type API struct {
 	Answers   []Answer
 	Edits     []Edit
 	ReactErr  error
+	SendErr   error
+	Files     map[string][]byte
+	Paths     map[string]string
+	FileErr   error
+	FileCalls []string // the file ids asked of GetFile, in order
 	next      int64
 }
 
 func (a *API) SendMessage(_ context.Context, r telegram.SendRequest) (int64, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.SendErr != nil {
+		return 0, a.SendErr
+	}
 	a.Sent = append(a.Sent, r)
 	a.next++
 	return 1000 + a.next, nil
 }
-func (a *API) SetMessageReaction(_ context.Context, _ int64, messageID int64, emoji string) error {
+
+// SetMessageReaction fails, recording nothing, on a ctx that is already
+// done, as a real request would.
+func (a *API) SetMessageReaction(ctx context.Context, _ int64, messageID int64, emoji string) error {
 	if a.ReactErr != nil {
 		return a.ReactErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -74,6 +91,62 @@ func (a *API) EditReplyMarkup(_ context.Context, _ int64, messageID int64, kb []
 	defer a.mu.Unlock()
 	a.Edits = append(a.Edits, Edit{MessageID: messageID, Text: "", Keyboard: kb})
 	return nil
+}
+
+// filePath is where the fake keeps a file: Paths' entry, else a voice
+// note's path as Telegram names it. The caller holds mu.
+func (a *API) filePath(fileID string) string {
+	if p, ok := a.Paths[fileID]; ok {
+		return p
+	}
+	return "voice/" + fileID + ".oga"
+}
+
+func (a *API) GetFile(_ context.Context, fileID string) (telegram.File, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.FileCalls = append(a.FileCalls, fileID)
+	if a.FileErr != nil {
+		return telegram.File{}, a.FileErr
+	}
+	data, ok := a.Files[fileID]
+	if !ok {
+		return telegram.File{}, &telegram.APIError{Code: 400, Description: "Bad Request: invalid file_id"}
+	}
+	return telegram.File{FileID: fileID, FileSize: int64(len(data)), FilePath: a.filePath(fileID)}, nil
+}
+
+func (a *API) Download(_ context.Context, path string, max int64) ([]byte, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for id, data := range a.Files {
+		if a.filePath(id) != path {
+			continue
+		}
+		if int64(len(data)) > max {
+			return nil, errors.New("file too big")
+		}
+		return append([]byte(nil), data...), nil
+	}
+	return nil, errors.New("http 404")
+}
+
+// Reacted returns the reactions set, in order.
+func (a *API) Reacted() []Reaction {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]Reaction(nil), a.Reactions...)
+}
+
+// Texts returns the texts of the messages sent, in order.
+func (a *API) Texts() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]string, len(a.Sent))
+	for i, r := range a.Sent {
+		out[i] = r.Text
+	}
+	return out
 }
 
 // LastText returns the text of the last message sent, or "".

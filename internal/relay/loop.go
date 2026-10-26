@@ -25,6 +25,8 @@ type Loop struct {
 	Once   bool          // handle what is pending, then return
 	MaxAge time.Duration // updates older than this on start are skipped
 	Log    func(string, ...any)
+
+	stopWait time.Duration // bound on the wait for the voice worker once Run stops it; 0: voiceStopWait
 }
 
 const (
@@ -40,12 +42,18 @@ func (l *Loop) logf(format string, args ...any) {
 }
 
 // updateTime is when an update was sent, or zero when unknown. A callback
-// carries only its message's date; for an ask tap ("a:") that is when the
-// question was sent, not when it was tapped, so a tap has no usable time:
-// the ask itself says whether it still waits and takes an answer once.
+// carries only its message's date: when the message with the button was
+// sent, not when it was tapped. So the relay's own taps have no usable
+// time, and what they act on decides instead: an ask tap ("a:") its ask,
+// which says whether it still waits and takes an answer once; a voice
+// confirmation's button ("v:") and a session pick ("s:") the parked text,
+// whose pendingTTL counts from the same moment as the message's date
+// (ruling R19), so an expired one still gets its expired outcome; a
+// button of /sessions ("p:") the session it names, which picks it only
+// while it is live.
 func updateTime(u telegram.Update) time.Time {
 	switch {
-	case u.CallbackQuery != nil && strings.HasPrefix(u.CallbackQuery.Data, "a:"):
+	case u.CallbackQuery != nil && undatedTap(u.CallbackQuery.Data):
 		return time.Time{}
 	case u.Message != nil && u.Message.Date != 0:
 		return time.Unix(u.Message.Date, 0)
@@ -53,6 +61,17 @@ func updateTime(u telegram.Update) time.Time {
 		return time.Unix(u.CallbackQuery.Message.Date, 0)
 	}
 	return time.Time{}
+}
+
+// undatedTap reports whether callback data is one of the relay's own
+// taps, which updateTime leaves undated.
+func undatedTap(data string) bool {
+	for _, prefix := range []string{"a:", "v:", "s:", pickData} {
+		if strings.HasPrefix(data, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // PartitionStale splits updates into those younger than maxAge and the rest.
@@ -74,15 +93,20 @@ func PartitionStale(ups []telegram.Update, now time.Time, maxAge time.Duration) 
 // saved) before it is acted on, so a crash never replays a keystroke; what
 // was in flight at the crash is lost, never repeated. Updates older than
 // MaxAge (the startup backlog, or what piled up while the Mac slept) are
-// skipped and counted; ask taps have no date of their own and are never
+// skipped and counted; the relay's button taps (asks, voice
+// confirmations, session picks) have no date of their own and are never
 // skipped. While the startup backlog drains the count adds up; after that,
-// each batch that skipped anything sends one notice with its count.
+// each batch that skipped anything sends one notice with its count. The
+// router handles updates on a ctx of Run's own, which ends whenever Run
+// returns, and the voice worker with it (stopVoice).
 func (l *Loop) Run(ctx context.Context) error {
 	release, err := l.Store.LockRelay()
 	if err != nil {
 		return err
 	}
 	defer release()
+	routed, stop := context.WithCancel(ctx)
+	defer l.stopVoice(ctx, stop)
 	maxAge := l.MaxAge
 	if maxAge <= 0 {
 		maxAge = defaultMaxAge
@@ -145,7 +169,7 @@ func (l *Loop) Run(ctx context.Context) error {
 				skipped++
 				continue
 			}
-			if err := l.Router.Handle(ctx, u); err != nil {
+			if err := l.Router.Handle(routed, u); err != nil {
 				l.logf("update %d: %v", u.UpdateID, err)
 			}
 			rs.LastUpdateAt = l.Router.now()
@@ -166,6 +190,40 @@ func (l *Loop) Run(ctx context.Context) error {
 		if l.Once {
 			return nil
 		}
+	}
+}
+
+// stopVoice ends the router's ctx (stop) and waits for the voice worker
+// before Run returns. With Once the queued notes first get all the time
+// they take, each bounded by the command's own timeout, unless ctx ends
+// (Ctrl-C): a first Whisper run that loads its model is not cut off
+// (ruling R23). Otherwise they are cancelled at once. After stop the wait
+// is bounded by stopWait: it lets a cancelled command's process group be
+// killed and its directory removed, and the dropped notes' 👀 cleared,
+// before the process exits; a transcription never completes after Run
+// returned, its ctx being done.
+func (l *Loop) stopVoice(ctx context.Context, stop context.CancelFunc) {
+	wait := l.stopWait
+	if wait <= 0 {
+		wait = voiceStopWait
+	}
+	done := make(chan struct{})
+	go func() {
+		l.Router.WaitVoice()
+		close(done)
+	}()
+	if l.Once {
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
+	}
+	stop()
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-t.C:
 	}
 }
 

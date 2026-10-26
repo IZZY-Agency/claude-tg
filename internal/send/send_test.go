@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -171,6 +172,19 @@ func TestSendRedactsConfiguredSecret(t *testing.T) {
 		t.Fatal(err)
 	}
 	if txt := rec.Calls[0].Text; strings.Contains(txt, "SECRET") || !strings.Contains(txt, "[redacted]") {
+		t.Fatalf("text=%q", txt)
+	}
+}
+
+// A label holds a tab name or a title, so it is cleaned as a body is:
+// credentials redacted in the header, as in a voice caption.
+func TestSendRedactsCredentialInLabel(t *testing.T) {
+	rec := &sendtest.Recorder{}
+	s := newSender(t, rec)
+	if _, err := s.Send(context.Background(), Message{Label: "ops password=hunter2hunter2", Body: "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	if txt := rec.Calls[0].Text; strings.Contains(txt, "hunter2") || !strings.Contains(txt, "[redacted]") {
 		t.Fatalf("text=%q", txt)
 	}
 }
@@ -412,5 +426,129 @@ func TestSendButtonsExhausted429NeverSpools(t *testing.T) {
 	}
 	if sess, _ := s.Store.LoadSession("sid"); len(sess.LastMessageIDs) != 0 {
 		t.Fatalf("an unsent message was recorded: %v", sess.LastMessageIDs)
+	}
+}
+
+func TestSenderSendVoice(t *testing.T) {
+	for _, tc := range []struct {
+		name, label string
+		d           time.Duration
+		caption     string
+		duration    int
+	}{
+		{"rounds up", "name", 6200 * time.Millisecond, "🔊 name", 7},
+		{"at least one second", "name", 300 * time.Millisecond, "🔊 name", 1},
+		{"whole seconds stay", "name", 5 * time.Second, "🔊 name", 5},
+		{"empty label", "", time.Second, "🔊 mac", 1},
+		{"secret scrubbed", "x 123456:SECRET-TOKEN", time.Second, "🔊 x [redacted]", 1},
+		{"label clipped", strings.Repeat("a", 100), time.Second, "🔊 " + strings.Repeat("a", maxLabel-1) + "…", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &sendtest.Recorder{}
+			s := newSender(t, rec)
+			s.Secrets = []string{"123456:SECRET-TOKEN"}
+			id, err := s.SendVoice(context.Background(), "sid", tc.label, []byte("ogg"), tc.d, true)
+			if err != nil || id == 0 {
+				t.Fatalf("id=%d err=%v", id, err)
+			}
+			if len(rec.Voices) != 1 {
+				t.Fatalf("voices=%d", len(rec.Voices))
+			}
+			v := rec.Voices[0]
+			if v.Caption != tc.caption || v.Duration != tc.duration || v.ChatID != 123456789 || string(v.Audio) != "ogg" || !v.Silent {
+				t.Fatalf("voice=%+v", v)
+			}
+			sess, _ := s.Store.LoadSession("sid")
+			if len(sess.LastMessageIDs) != 1 || sess.LastMessageIDs[0] != id {
+				t.Fatalf("LastMessageIDs=%v want %d", sess.LastMessageIDs, id)
+			}
+		})
+	}
+}
+
+// A duration that is not positive or that no voice message has (beyond
+// maxVoiceDuration) is refused before any request; near the cap the
+// seconds still round up rather than overflow.
+func TestSenderSendVoiceDuration(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		d    time.Duration
+		secs int // 0: refused
+	}{
+		{"zero", 0, 0},
+		{"negative", -time.Second, 0},
+		{"near the largest duration", time.Duration(math.MaxInt64), 0},
+		{"just over the cap", maxVoiceDuration + time.Nanosecond, 0},
+		{"the cap", maxVoiceDuration, 86400},
+		{"just under the cap", maxVoiceDuration - time.Nanosecond, 86400},
+		{"one nanosecond", time.Nanosecond, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &sendtest.Recorder{}
+			s := newSender(t, rec)
+			_, err := s.SendVoice(context.Background(), "sid", "x", []byte("ogg"), tc.d, false)
+			if tc.secs == 0 {
+				if err == nil || !strings.HasPrefix(err.Error(), "unsupported voice duration") || len(rec.Voices) != 0 {
+					t.Fatalf("err=%v voices=%+v, want refused before any request", err, rec.Voices)
+				}
+				return
+			}
+			if err != nil || len(rec.Voices) != 1 || rec.Voices[0].Duration != tc.secs {
+				t.Fatalf("err=%v voices=%+v, want %d s", err, rec.Voices, tc.secs)
+			}
+		})
+	}
+}
+
+// A voice message is never spooled: heard hours late it would mislead.
+func TestSenderSendVoiceNotSpooled(t *testing.T) {
+	rec := &sendtest.Recorder{Script: []error{&telegram.NetError{Err: errors.New("dial tcp: refused")}}}
+	s := newSender(t, rec)
+	if _, err := s.SendVoice(context.Background(), "sid", "x", []byte("ogg"), time.Second, false); !telegram.IsNetwork(err) {
+		t.Fatalf("err=%v", err)
+	}
+	if items, _ := s.Store.SpoolList(); len(items) != 0 {
+		t.Fatalf("spooled %d items", len(items))
+	}
+	if sess, _ := s.Store.LoadSession("sid"); len(sess.LastMessageIDs) != 0 {
+		t.Fatalf("recorded ids after a failure: %v", sess.LastMessageIDs)
+	}
+}
+
+func TestSenderSendVoice429(t *testing.T) {
+	rec := &sendtest.Recorder{Script: []error{&telegram.APIError{Code: 429, Description: "Too Many Requests: retry after 1", RetryAfter: 1}, nil}}
+	s := newSender(t, rec)
+	var slept time.Duration
+	s.Sleep = func(d time.Duration) { slept += d }
+	if _, err := s.SendVoice(context.Background(), "sid", "x", []byte("ogg"), time.Second, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.Voices) != 2 || slept < time.Second {
+		t.Fatalf("voices=%d slept=%v", len(rec.Voices), slept)
+	}
+}
+
+// A 400 is final: there is no plain-text fallback for audio.
+func TestSenderSendVoiceRefused(t *testing.T) {
+	rec := &sendtest.Recorder{Script: []error{&telegram.APIError{Code: 400, Description: "Bad Request"}}}
+	s := newSender(t, rec)
+	_, err := s.SendVoice(context.Background(), "sid", "x", []byte("ogg"), time.Second, false)
+	var api *telegram.APIError
+	if !errors.As(err, &api) || len(rec.Voices) != 1 {
+		t.Fatalf("err=%v voices=%d", err, len(rec.Voices))
+	}
+}
+
+// textOnly implements API but not VoiceAPI.
+type textOnly struct{}
+
+func (textOnly) SendMessage(context.Context, telegram.SendRequest) (int64, error) { return 1, nil }
+
+func TestSenderSendVoiceNoVoiceAPI(t *testing.T) {
+	s := newSender(t, &sendtest.Recorder{})
+	s.API = textOnly{}
+	_, err := s.SendVoice(context.Background(), "sid", "x", []byte("ogg"), time.Second, false)
+	if err == nil || err.Error() != "telegram client cannot send voice" {
+		t.Fatalf("err=%v", err)
 	}
 }

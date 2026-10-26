@@ -10,8 +10,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
+	"github.com/IZZY-Agency/claude-tg/internal/render"
 	"github.com/IZZY-Agency/claude-tg/internal/state"
+	"github.com/IZZY-Agency/claude-tg/internal/transcript"
 )
 
 // Env is what the process environment tells us about the current session.
@@ -23,6 +27,7 @@ type Env struct {
 	TmuxPane        string // tmux pane id such as %5
 	TmuxSocket      string // tmux server socket path, from $TMUX
 	PID             int
+	TranscriptPath  string // the session's transcript, from a hook's input; "" otherwise
 	// Own is true when these facts come from the session's own process
 	// environment (hooks, tg run inside the session). Only then may they
 	// replace the recorded working directory, pid and terminal pane.
@@ -100,6 +105,87 @@ func ListAgents(ctx context.Context, claudePath string) ([]Agent, error) {
 	return ParseAgents(out)
 }
 
+// TabFunc looks up the name of agterm session agtermID's tab; ok is false
+// when agterm has no such session.
+type TabFunc func(ctx context.Context, agtermID string) (name string, ok bool, err error)
+
+// Options are what Resolve labels a session with: Tab looks up its agterm
+// tab's name (nil = no lookup), and Clean cleans a tab name and a title as
+// a message is (the secrets scrubbed, credentials redacted) before the
+// label cuts them (nil = as they are).
+type Options struct {
+	Tab   TabFunc
+	Clean func(string) string
+}
+
+// tabTimeout bounds the tab lookup: agtermctl answers in 10 to 20 ms, and
+// the Stop hook's answer must not wait on a stalled agterm.
+const tabTimeout = time.Second
+
+// UserTab returns a tab name the owner chose, trimmed, and "" for a frozen
+// copy of Claude Code's terminal title, which agterm gives a tab the owner
+// did not name: its first rune is not a letter or a digit, and a space
+// follows ("✳ Login token…", "◐ Claude Code"). (A tab the owner names
+// "🔥 hotfix" is taken for such a copy.)
+func UserTab(name string) string {
+	name = strings.TrimSpace(name)
+	r, size := utf8.DecodeRuneInString(name)
+	if name == "" || !unicode.IsLetter(r) && !unicode.IsDigit(r) && strings.HasPrefix(name[size:], " ") {
+		return ""
+	}
+	return name
+}
+
+// titleRunes is the most runes of Claude Code's title a label shows.
+const titleRunes = 30
+
+// Label is the name tg shows for a session (spec
+// 2026-10-26-session-labels-and-picker-design.md): the owner's tab name
+// (UserTab), else the last element of cwd, " · " and Claude Code's title
+// cut to titleRunes (shortTitle), else Claude Code's name, else
+// FallbackLabel.
+func Label(tab, cwd, title, claudeName, sessionID string) string {
+	if t := UserTab(tab); t != "" {
+		return t
+	}
+	if title = shortTitle(title); title != "" {
+		if cwd == "" {
+			return title
+		}
+		return filepath.Base(cwd) + " · " + title
+	}
+	if strings.TrimSpace(claudeName) != "" {
+		return claudeName
+	}
+	return FallbackLabel(cwd, sessionID)
+}
+
+// shortTitle returns title's words whole, as many as fit in titleRunes
+// with a "…" after them, or title itself when it fits; a first word too
+// long alone is cut.
+func shortTitle(title string) string {
+	words := strings.Fields(title)
+	title = strings.Join(words, " ")
+	if utf8.RuneCountInString(title) <= titleRunes {
+		return title
+	}
+	out := ""
+	for _, w := range words {
+		next := w
+		if out != "" {
+			next = out + " " + w
+		}
+		if utf8.RuneCountInString(next) > titleRunes-1 {
+			break
+		}
+		out = next
+	}
+	if out == "" {
+		out = string([]rune(words[0])[:titleRunes-1])
+	}
+	return out + "…"
+}
+
 // FallbackLabel is used when the session name cannot be resolved.
 func FallbackLabel(cwd, sessionID string) string {
 	base := ""
@@ -123,16 +209,28 @@ func FallbackLabel(cwd, sessionID string) string {
 
 const nameTTL = 10 * time.Minute
 
-// Resolve loads the session record, refreshes it from env, resolves the name
-// through `claude agents --json` when the cached one is stale, falls back to
-// FallbackLabel, saves and returns it. It never fails because claude is missing.
-func Resolve(ctx context.Context, store *state.Store, claudePath string, env Env) (*state.Session, error) {
+// Resolve loads the session record, refreshes it from env, resolves Claude
+// Code's name through `claude agents --json` when the cached one is stale,
+// reads the session's title from env's transcript (transcript.Title) and
+// its tab name through opt.Tab within tabTimeout, cleans both (opt.Clean),
+// labels the session (Label), saves and returns it. A title or tab it
+// cannot read now keeps the one stored; a session whose own environment
+// has no agterm id has no tab. It never fails because claude or agterm is
+// missing.
+func Resolve(ctx context.Context, store *state.Store, claudePath string, env Env, opt Options) (*state.Session, error) {
+	clean := opt.Clean
+	if clean == nil {
+		clean = func(s string) string { return s }
+	}
 	sess, err := store.LoadSession(env.SessionID)
 	if err != nil {
 		return nil, err
 	}
 	now := time.Now()
-	name, resolvedAt := sess.Name, sess.NameResolvedAt
+	name, resolvedAt := sess.ClaudeName, sess.NameResolvedAt
+	if name == "" && !resolvedAt.IsZero() {
+		name = sess.Name // a record from before labels: Name was Claude Code's
+	}
 	// Re-resolve when no real name was ever resolved (fallback in use) or the
 	// cached one is older than nameTTL. This may run a subprocess, so it
 	// happens outside the session lock.
@@ -143,6 +241,31 @@ func Resolve(ctx context.Context, store *state.Store, claudePath string, env Env
 					name, resolvedAt = a.Name, now
 					break
 				}
+			}
+		}
+	}
+	title, haveTitle := "", false
+	if env.TranscriptPath != "" {
+		if t, ok, err := transcript.Title(env.TranscriptPath); err == nil && ok {
+			title, haveTitle = clean(t), true
+		}
+	}
+	agtermID := sess.AgtermSessionID
+	if env.Own {
+		agtermID = env.AgtermSessionID
+	}
+	tabName, haveTab := "", false
+	switch {
+	case agtermID == "" && env.Own:
+		haveTab = true // out of agterm: no tab
+	case agtermID != "" && opt.Tab != nil:
+		tctx, cancel := context.WithTimeout(ctx, tabTimeout)
+		n, ok, err := opt.Tab(tctx, agtermID)
+		cancel()
+		if err == nil {
+			haveTab = true
+			if ok {
+				tabName = UserTab(clean(n))
 			}
 		}
 	}
@@ -161,10 +284,22 @@ func Resolve(ctx context.Context, store *state.Store, claudePath string, env Env
 		}
 		s.LastSeen = now
 		if name != "" {
-			s.Name, s.NameResolvedAt = name, resolvedAt
+			s.ClaudeName, s.NameResolvedAt = name, resolvedAt
 		}
-		if s.Name == "" {
-			s.Name = FallbackLabel(s.Cwd, s.SessionID)
+		if haveTitle {
+			s.Title = title
+		}
+		if haveTab {
+			s.Tab = tabName
+		}
+		// Every part cleaned, a title before it is cut, and the label too
+		// (the folder), in the form every message shows it
+		// (render.ShownName): the label stored is the label shown, and one
+		// copied from a message addresses the session.
+		label := clean(Label(clean(s.Tab), s.Cwd, clean(s.Title), clean(s.ClaudeName), s.SessionID))
+		s.Name, s.FullLabel = render.ShownName(label), ""
+		if full := render.FullName(label); full != s.Name {
+			s.FullLabel = full // a name typed in full addresses the session too
 		}
 	})
 }

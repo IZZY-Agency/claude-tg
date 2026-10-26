@@ -1,0 +1,85 @@
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Opus 5.5 with xhigh effort · Claude Max
+ ▝▝   ▝▝   /Users/alex/proj
+
+⚠ Your login expires in 2 days · run /login to renew
+
+❯ Reply with the single word: ready                                                                                                            
+
+⏺ ready
+
+✻ Sautéed for 3s · done 8:49 AM
+
+❯  What is the weather in Paris today?                                                                                                         
+
+⏺ Calling AccuWeather® 4 times…
+  ⎿  Allowed by PermissionRequest hook
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Tool use                                                                                                                               1 of 2
+ AccuWeather® — Current Weather Tool: (MCP)
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ queryParams: { locationKey: "2608456", unit: "metric", lang: "en" }
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ About the AccuWeather® — Current Weather Tool:
+ │ Get current weather conditions, air quality, and any active government alerts for a specified location key.
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for AccuWeather® — Current Weather commands in /Users/alex/proj
+   3. No
+
+ Esc to cancel · Tab to amend
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
+  
+  

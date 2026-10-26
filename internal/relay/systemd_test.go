@@ -26,6 +26,8 @@ func TestUnitContainsCommandEnvAndLog(t *testing.T) {
 		"ExecStart=/home/x/.local/bin/tg relay\n",
 		"Restart=always\n",
 		"RestartSec=10\n",
+		// systemd signals only the relay, which ends its voice command itself
+		"KillMode=mixed\n",
 		"Environment=PATH=/home/x/.local/bin:/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin\n",
 		"Environment=HOME=/home/x\n",
 		// extra variables come sorted, after PATH and HOME

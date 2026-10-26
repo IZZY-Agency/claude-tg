@@ -11,6 +11,7 @@ import (
 	"github.com/IZZY-Agency/claude-tg/internal/ask"
 	"github.com/IZZY-Agency/claude-tg/internal/render"
 	"github.com/IZZY-Agency/claude-tg/internal/send"
+	"github.com/IZZY-Agency/claude-tg/internal/speech"
 	"github.com/IZZY-Agency/claude-tg/internal/state"
 	"github.com/IZZY-Agency/claude-tg/internal/telegram"
 )
@@ -105,7 +106,10 @@ func (r *Router) askRefusal(l *Live) error {
 			answered = true
 		case len(a.MessageIDs) > 0:
 			sent = true
-		default:
+		case a.Signature != "":
+			// Its hook adopted the dialog and waits for the owner to be
+			// away. One still looking for its dialog (a call queued behind
+			// another, ruling P25) promises nothing: the pane decides.
 			waiting = true
 		}
 	}
@@ -161,11 +165,16 @@ func (r *Router) decideReplied(ctx context.Context, m *telegram.Message, a *stat
 	if a.Closed != "" {
 		return r.reply(ctx, m, promptClosed)
 	}
-	name := a.SessionName
-	if name == "" {
-		name = a.SessionID
+	return r.decideAsk(ctx, m, askName(a), []*state.Ask{a}, approve)
+}
+
+// askName is the ask's session as the phone names it: its name, else its
+// id.
+func askName(a *state.Ask) string {
+	if a.SessionName != "" {
+		return a.SessionName
 	}
-	return r.decideAsk(ctx, m, name, []*state.Ask{a}, approve)
+	return a.SessionID
 }
 
 // decideAsk is /approve or /deny on asks[0]: the prompt replied to, or the
@@ -184,7 +193,7 @@ func (r *Router) decideAsk(ctx context.Context, m *telegram.Message, name string
 		action, emoji, word = 'n', "👎", "denied"
 	}
 	var res ask.Result
-	b, expired, done, err := r.changeAsk(a.ID, func(a *state.Ask) { res = ask.ApplyTap(a, ask.Tap{AskID: a.ID, Action: action}) })
+	b, expired, done, err := r.changeAsk(a.ID, func(a *state.Ask) { res = ask.ApplyTap(a, ask.Tap{AskID: a.ID, Action: action}) }, false, "")
 	if errors.Is(err, os.ErrNotExist) {
 		return r.reply(ctx, m, toastGone)
 	}
@@ -235,20 +244,30 @@ func (r *Router) answerCallback(ctx context.Context, cq *telegram.CallbackQuery,
 // Stop hook must then find it owed. Done is set once per ask, so the
 // answer is credited once (Ask.Armed); the credit is taken back when the
 // ask cannot be saved, and by the hook (or its sweep) when the Mac wins.
-func (r *Router) changeAsk(id string, fn func(*state.Ask)) (a *state.Ask, expired, done bool, err error) {
-	armed := ""
+// With voice, fn applies a voice reply in language lang (speech.Language,
+// "" when unknown): completing the ask also marks the session with the
+// ask's id and lang (so that its answer is spoken), followed or not, and
+// the mark is taken back wherever the credit is.
+func (r *Router) changeAsk(id string, fn func(*state.Ask), voice bool, lang string) (a *state.Ask, expired, done bool, err error) {
+	added := "" // the session armAsk credited or marked
 	a, err = r.Store.UpdateAsk(id, func(a *state.Ask) error {
 		expired = r.expireIfGone(a)
 		was := a.Done
 		fn(a)
 		done = !was && a.Done
-		if done && r.armAsk(a.SessionID, a.ID) {
-			a.Armed, armed = true, a.SessionID
+		if done {
+			armed, marked := r.armAsk(a.SessionID, a.ID, voice, lang)
+			if armed {
+				a.Armed = true
+			}
+			if armed || marked {
+				added = a.SessionID
+			}
 		}
 		return nil
 	})
-	if err != nil && armed != "" {
-		r.disarm(armed, id)
+	if err != nil && added != "" {
+		r.disarm(added, id)
 	}
 	return a, expired, done && err == nil, err
 }
@@ -270,7 +289,7 @@ func (r *Router) tap(ctx context.Context, cq *telegram.CallbackQuery) error {
 			return
 		}
 		res = ask.ApplyTap(a, t)
-	})
+	}, false, "")
 	if errors.Is(err, os.ErrNotExist) {
 		if err := r.API.EditReplyMarkup(ctx, r.ChatID, cq.Message.MessageID, [][]telegram.Button{}); err != nil {
 			r.logf("clear keyboard: %v", err)
@@ -290,19 +309,33 @@ func (r *Router) tap(ctx context.Context, cq *telegram.CallbackQuery) error {
 // replyToAsk applies a swipe-reply to message index of an open ask: it
 // answers a question or denies a permission prompt; it is never typed.
 func (r *Router) replyToAsk(ctx context.Context, m *telegram.Message, id string, index int, text string) error {
-	var res ask.Result
-	a, expired, done, err := r.changeAsk(id, func(a *state.Ask) { res = ask.ApplyReply(a, index, text) })
-	if errors.Is(err, os.ErrNotExist) {
-		return r.reply(ctx, m, toastGone)
-	}
-	if err != nil {
-		return r.reply(ctx, m, "could not read this request: "+render.EscapeHTML(err.Error()))
-	}
-	toast := r.settle(ctx, a, res, expired, done)
-	if res.Edit != "" && toast == res.Toast && r.react(ctx, m, "👍") {
+	_, toast, ok := r.answerAsk(ctx, id, index, text, false)
+	if ok && r.react(ctx, m, "👍") {
 		return nil
 	}
 	return r.reply(ctx, m, render.EscapeHTML(toast))
+}
+
+// answerAsk applies text as a reply to message index of ask id, as a
+// swipe-reply and a confirmed voice note's Send (voice) do, and settles
+// it. It returns the ask as saved (nil when it could not be read), the
+// outcome for the owner (plain text: the result's toast, or why nothing
+// was answered) and whether the text answered the ask.
+func (r *Router) answerAsk(ctx context.Context, id string, index int, text string, voice bool) (*state.Ask, string, bool) {
+	var res ask.Result
+	lang := ""
+	if voice {
+		lang = speech.Language(text)
+	}
+	a, expired, done, err := r.changeAsk(id, func(a *state.Ask) { res = ask.ApplyReply(a, index, text) }, voice, lang)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, toastGone, false
+	}
+	if err != nil {
+		return nil, "could not read this request: " + err.Error(), false
+	}
+	toast := r.settle(ctx, a, res, expired, done)
+	return a, toast, res.Edit != "" && toast == res.Toast
 }
 
 // errNoSave ends an UpdateAsk fn that changed nothing worth saving.
@@ -408,20 +441,30 @@ func settled(a *state.Ask, done bool) error {
 // armAsk makes the session owe its next answer to the phone once ask
 // askID is answered from it, as a typed reply does, with a credit of the
 // ask's own (state.Session.ArmAsk), and reports whether it added one;
-// followed sessions report every answer anyway.
-func (r *Router) armAsk(sessionID, askID string) bool {
+// followed sessions report every answer anyway. With voice (the answer
+// was a voice reply, in language lang) the same write marks the session
+// with the ask's id (state.Session.MarkVoice), followed or not, and
+// marked reports it.
+func (r *Router) armAsk(sessionID, askID string, voice bool, lang string) (armed, marked bool) {
 	if sessionID == "" {
-		return false
+		return false, false
 	}
-	armed := false
-	if _, err := r.Store.UpdateSession(sessionID, func(s *state.Session) { armed = s.ArmAsk(askID) }); err != nil {
+	now := r.now()
+	if _, err := r.Store.UpdateSession(sessionID, func(s *state.Session) {
+		armed = s.ArmAsk(askID)
+		if voice {
+			s.MarkVoice(askID, lang, now)
+			marked = true
+		}
+	}); err != nil {
 		r.logf("pending answers: %v", err)
-		return false
+		return false, false
 	}
-	return armed
+	return armed, marked
 }
 
-// disarm takes back the credit armAsk added for ask askID.
+// disarm takes back the credit and the voice mark armAsk added for ask
+// askID (state.Session.DropAsk drops both).
 func (r *Router) disarm(sessionID, askID string) {
 	if _, err := r.Store.UpdateSession(sessionID, func(s *state.Session) { s.DropAsk(askID) }); err != nil {
 		r.logf("pending answers: %v", err)
@@ -431,20 +474,39 @@ func (r *Router) disarm(sessionID, askID string) {
 // retire removes an ask no hook will remove. When closed (it was open and
 // has just been closed because its hook is gone), each sent message still
 // waiting for an answer says why and loses its buttons first. An ask
-// answered from the phone whose hook never collected the answer did not
-// reach Claude: every message of it says so. One the hook collected did:
-// if the relay never showed the answer (it stopped between saving it and
-// its edit), each answered message shows it now; then it is removed.
+// answered from the phone whose hook never collected the answer may not
+// have reached Claude: its voice mark is dropped, and every message of it
+// says it was not delivered. One the hook collected did: if the relay
+// never showed the answer (it stopped between saving it and its edit),
+// each answered message shows it now; then it is removed.
 func (r *Router) retire(ctx context.Context, a *state.Ask, closed bool) {
-	if a.TakeBack {
-		// Its hook could not take the phone's counted answer back in time
-		// (the session's lock was busy); once per ask, so a hook that did
-		// it before going changes nothing here.
+	// What the session still holds for the phone's answer goes first, once
+	// per ask, so a hook that did it before going changes nothing here;
+	// when it fails the ask stays, unedited, for the next sweep.
+	//   - TakeBack: its hook could not take the counted answer back in time
+	//     (the session's lock was busy); credit and voice mark go.
+	//   - Uncollected: the hook went without recording that it collected
+	//     the answer. Its stdout write may have failed, or it may have
+	//     written the answer and been unable to record that (its commit
+	//     gave up, or it was killed in between), so the answer may well
+	//     have reached Claude: the credit stays, owing the phone that
+	//     answer's text as it always did, and only the voice mark goes, so
+	//     no later answer is spoken for it.
+	uncollected := !closed && a.Closed == "" && a.Done && !a.Collected
+	var drop func(ctx context.Context, sessionID, askID string) error
+	what := ""
+	switch {
+	case a.TakeBack:
+		drop, what = r.Store.TakeBackAnswer, "take back the answer owed"
+	case uncollected:
+		drop, what = r.Store.DropVoiceMark, "drop the voice mark"
+	}
+	if drop != nil {
 		tctx, cancel := context.WithTimeout(ctx, sessionWait)
-		err := r.Store.TakeBackAnswer(tctx, a.SessionID, a.ID)
+		err := drop(tctx, a.SessionID, a.ID)
 		cancel()
 		if err != nil {
-			r.logf("ask %s: take back the answer owed: %v; the next sweep retries", a.ID, err)
+			r.logf("ask %s: %s: %v; the next sweep retries", a.ID, what, err)
 			return
 		}
 	}
@@ -525,8 +587,9 @@ func (r *Router) editOutcome(ctx context.Context, a *state.Ask, outcome string, 
 // dead, it has no hook pid or deadline, or it is long past its deadline):
 // an open one is closed ("session ended" when its session has ended, else
 // "expired: answer at the Mac") and its unanswered messages say so; one
-// answered from the phone but never collected says "not delivered: answer
-// at the Mac" (one its hook collected says nothing); each is then removed,
+// answered from the phone but never collected has its voice mark dropped
+// and says "not delivered: answer at the Mac" (one its hook collected
+// says nothing); each is then removed,
 // since its hook never will. It also
 // removes ask files no one can read once they are an hour old, and prunes
 // the lock files removed asks leave behind.

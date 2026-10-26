@@ -26,6 +26,29 @@ type Config struct {
 	BinaryPath       string    `json:"binary_path,omitempty"`
 	AwayAfterSeconds int       `json:"away_after_seconds"`
 	InstalledAt      time.Time `json:"installed_at,omitempty"`
+	// VoiceCommand is a shell string that turns a voice note into text; see
+	// the voice package. Empty means voice notes are not supported.
+	VoiceCommand string `json:"voice_command,omitempty"`
+	// SpeechCommand is a shell string that turns text into an OGG/Opus file;
+	// see the voice package. Empty means answers are never spoken.
+	SpeechCommand string `json:"speech_command,omitempty"`
+	// TypesafeAPIKey is the TypeSafe API key with which a hook asks whether
+	// a typed phone answer is worth speaking; see the classify package.
+	// Empty means typed answers are never spoken.
+	TypesafeAPIKey string `json:"typesafe_api_key,omitempty"`
+}
+
+// Secrets are the configured values that no message, button or log line
+// may show (send.Sender.Secrets): the bot token and the TypeSafe API key,
+// those that are set.
+func (c *Config) Secrets() []string {
+	var out []string
+	for _, s := range []string{c.BotToken, c.TypesafeAPIKey} {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func homeDir() string {

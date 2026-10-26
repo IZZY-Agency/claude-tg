@@ -64,9 +64,19 @@ func cmdRelay(c *cli, args []string) int {
 	logf("%s", backendsLine("none (replies will be refused)"))
 	terminals := term.Mux{Backends: map[string]term.Terminal{agterm.Backend: &agterm.CLI{}, tmux.Backend: &tmux.CLI{}}}
 	router := &relay.Router{
-		API: a.client, Store: a.store, Term: terminals, ChatID: a.cfg.ChatID, UserID: a.cfg.UserID, Secrets: []string{a.cfg.BotToken},
+		API: a.client, Store: a.store, Term: terminals, ChatID: a.cfg.ChatID, UserID: a.cfg.UserID, Secrets: a.cfg.Secrets(),
 		Agents: func(ctx context.Context) ([]session.Agent, error) { return session.ListAgents(ctx, a.cfg.ClaudePath) },
 		Log:    logf, StartedAt: time.Now(),
+	}
+	if a.cfg.VoiceCommand != "" {
+		router.Transcriber = voiceRunner(c, a.cfg.VoiceCommand)
+	}
+	// A run killed before it cleaned up (a crash, kill -9, a power loss)
+	// left its folder, audio included.
+	if n, err := voiceRunner(c, a.cfg.VoiceCommand).RemoveStale(); err != nil {
+		logf("voice: remove old note folders: %v", err)
+	} else if n > 0 {
+		logf("voice: removed %d note folder(s) left by an earlier run", n)
 	}
 	loop := &relay.Loop{Poll: a.client, Router: router, Store: a.store, Once: *once, Log: logf}
 	if err := loop.Run(ctx); err != nil {

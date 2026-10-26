@@ -8,12 +8,14 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/IZZY-Agency/claude-tg/internal/ask"
+	"github.com/IZZY-Agency/claude-tg/internal/render"
 	"github.com/IZZY-Agency/claude-tg/internal/state"
 	"github.com/IZZY-Agency/claude-tg/internal/telegram"
 	"github.com/IZZY-Agency/claude-tg/internal/term"
@@ -203,9 +205,13 @@ func TestWaitCheapSkips(t *testing.T) {
 		"claude -p":     func(w *waitHarness, _ *Input) { w.deps.Unattended = func() bool { return true } },
 		"no transcript": func(w *waitHarness, _ *Input) { w.watchErr = os.ErrNotExist },
 		// Ruling R30: no text of the call to find in a dialog, so no
-		// dialog can be tied to it.
+		// dialog can be tied to it (P21: numbers and booleans alone tie
+		// no call to a dialog).
 		"a tool without a key": func(_ *waitHarness, in *Input) {
-			in.ToolName, in.ToolInput = "mcp__linear__save_issue", json.RawMessage(`{"title":"Fix the login"}`)
+			in.ToolName, in.ToolInput = "mcp__linear__save_issue", json.RawMessage(`{"n":3,"b":true}`)
+		},
+		"a tool with floats and nulls only": func(_ *waitHarness, in *Input) {
+			in.ToolName, in.ToolInput = "mcp__linear__save_issue", json.RawMessage(`{"n":3.5,"b":null}`)
 		},
 	}
 	for name, setup := range cases {
@@ -342,6 +348,266 @@ func TestWaitPutsAskBeforeWaiting(t *testing.T) {
 	waitPermission(context.Background(), load(t, "permission_request_bash.json"), w.deps)
 	if w.sleeps != 1 {
 		t.Fatalf("sleeps=%d", w.sleeps)
+	}
+}
+
+// A turn started from the phone sends the buttons at once, though the
+// owner counts as at the Mac for another hour; one started at the Mac
+// waits as TestWaitAnsweredAtMacBeforeAway shows.
+func TestWaitPhoneStartedSendsAtOnce(t *testing.T) {
+	w := newWaitHarness(t)
+	w.away = false
+	w.deps.AwayIn = func(context.Context) time.Duration { return time.Hour }
+	w.deps.FromPhone = func(*Input, *state.Session) bool { return true }
+	var logs []string
+	w.deps.Log = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+	start := w.now
+	w.onSleep = func() {
+		if len(w.rec.Calls) == 1 {
+			w.mac = true
+		}
+	}
+	waitPermission(context.Background(), load(t, "permission_request_bash.json"), w.deps)
+	if len(w.rec.Calls) != 1 || w.now.Sub(start) > 2*time.Second {
+		t.Fatalf("calls=%d after %s", len(w.rec.Calls), w.now.Sub(start))
+	}
+	want := "permission-wait (" + sid + "): phone-started turn: sending now"
+	if !slices.Contains(logs, want) {
+		t.Fatalf("log line missing: %q", logs)
+	}
+
+	w = newWaitHarness(t)
+	w.away = false
+	w.deps.AwayIn = func(context.Context) time.Duration { return time.Hour }
+	w.deps.FromPhone = func(*Input, *state.Session) bool { return false }
+	logs = nil
+	w.deps.Log = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+	w.onSleep = func() {
+		if w.sleeps == 3 {
+			w.mac = true
+		}
+	}
+	waitPermission(context.Background(), load(t, "permission_request_bash.json"), w.deps)
+	if len(w.rec.Calls) != 0 {
+		t.Fatalf("a Mac-started turn sent: calls=%d", len(w.rec.Calls))
+	}
+	if slices.Contains(logs, want) {
+		t.Fatalf("phone-started line logged for a Mac-started turn: %q", logs)
+	}
+}
+
+// A negative phone check is made again every 5 s during the first 30 s of
+// the wait (ruling P14): the relay records its line only once its Enter
+// returns, which may be after the hook first looked. A turn found
+// phone-started by a recheck sends at once; one never found so waits for
+// the idle time as before; nothing is rechecked after 30 s. Why the turn
+// does not count is logged once per hook call.
+func TestWaitRechecksPhone(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		phoneFrom int           // the call from which FromPhone says yes; 0 = never
+		sentAt    time.Duration // -1 = not sent
+	}{
+		{"phone-started at the second check", 2, 5 * time.Second},
+		{"phone-started at the last check within 30 s", 6, 25 * time.Second},
+		{"never phone-started", 0, -1},
+		{"phone-started only after 30 s", 7, -1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w := newWaitHarness(t)
+			w.away = false
+			idleReads := 0
+			w.deps.AwayIn = func(context.Context) time.Duration { idleReads++; return time.Hour }
+			start := w.now
+			var checks []time.Duration
+			w.deps.FromPhone = func(*Input, *state.Session) bool {
+				checks = append(checks, w.now.Sub(start))
+				return c.phoneFrom > 0 && len(checks) >= c.phoneFrom
+			}
+			var logs []string
+			w.deps.Log = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+			sentAt := time.Duration(-1)
+			w.onSleep = func() {
+				if len(w.rec.Calls) == 1 && sentAt < 0 {
+					sentAt = w.now.Sub(start)
+					w.mac = true
+				}
+				if w.now.Sub(start) >= 2*time.Minute {
+					w.mac = true
+				}
+			}
+			waitPermission(context.Background(), load(t, "permission_request_bash.json"), w.deps)
+			// A message sent at s is first seen by the sleep ending a
+			// second later.
+			if want := c.sentAt; (want < 0 && sentAt >= 0) || (want >= 0 && sentAt != want+time.Second) {
+				t.Fatalf("sent at %s (checks at %v), want %s", sentAt, checks, want)
+			}
+			wantChecks := []time.Duration{0, 5 * time.Second, 10 * time.Second, 15 * time.Second, 20 * time.Second, 25 * time.Second}
+			if c.phoneFrom > 0 && c.phoneFrom < len(wantChecks) {
+				wantChecks = wantChecks[:c.phoneFrom]
+			}
+			if !slices.Equal(checks, wantChecks) {
+				t.Fatalf("checks at %v, want %v", checks, wantChecks)
+			}
+			phoneLine := slices.Contains(logs, "permission-wait ("+sid+"): phone-started turn: sending now")
+			if phoneLine != (c.sentAt >= 0) {
+				t.Fatalf("logs = %q", logs)
+			}
+			// The rechecks add no idle reads: the hour's wait is read once.
+			if idleReads != 1 {
+				t.Fatalf("idle time read %d times, want once", idleReads)
+			}
+		})
+	}
+}
+
+// The relay's record lands 3 s after the hook first looked (its Enter
+// was slow to return): the real check finds it at the 5-second recheck,
+// and the buttons go out then.
+func TestWaitRecheckFindsALateRecord(t *testing.T) {
+	w := newWaitHarness(t)
+	w.away = false
+	w.deps.AwayIn = func(context.Context) time.Duration { return time.Hour }
+	start := w.now
+	in := load(t, "permission_request_bash.json")
+	in.TranscriptPath = writePrompts(t, promptLine{start, " Привет"})
+	w.deps.Watch = func(string, string, json.RawMessage) (Watcher, error) {
+		return pollFunc(func() (bool, error) { return w.mac, nil }), nil
+	}
+	sentAt := time.Duration(-1)
+	w.onSleep = func() {
+		if w.now.Sub(start) == 3*time.Second {
+			if _, err := w.store.UpdateSession(sid, func(s *state.Session) { s.RecordPhoneLine("Привет", w.now, false) }); err != nil {
+				t.Error(err)
+			}
+		}
+		if len(w.rec.Calls) == 1 && sentAt < 0 {
+			sentAt = w.now.Sub(start)
+			w.mac = true
+		}
+		if w.now.Sub(start) >= time.Minute {
+			w.mac = true
+		}
+	}
+	waitPermission(context.Background(), in, w.deps)
+	if sentAt != 6*time.Second {
+		t.Fatalf("buttons first seen at %s, want 6s (sent at the 5-second recheck)", sentAt)
+	}
+}
+
+// Why a turn of a session holding phone lines is not phone-started is
+// logged once per waiting hook, however often it is rechecked.
+func TestWaitLogsPhoneCheckOnce(t *testing.T) {
+	w := newWaitHarness(t)
+	w.away = false
+	w.deps.AwayIn = func(context.Context) time.Duration { return time.Hour }
+	in := load(t, "permission_request_bash.json")
+	in.TranscriptPath = writePrompts(t, promptLine{w.now, "typed at the Mac"})
+	if _, err := w.store.UpdateSession(sid, func(s *state.Session) { s.RecordPhoneLine("Привет", w.now, false) }); err != nil {
+		t.Fatal(err)
+	}
+	w.deps.Watch = func(string, string, json.RawMessage) (Watcher, error) {
+		return pollFunc(func() (bool, error) { return w.mac, nil }), nil
+	}
+	start := w.now
+	w.onSleep = func() {
+		if w.now.Sub(start) >= time.Minute {
+			w.mac = true
+		}
+	}
+	var logs []string
+	w.deps.Log = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+	waitPermission(context.Background(), in, w.deps)
+	n := 0
+	for _, l := range logs {
+		if l == "phone check ("+sid+"): last prompt was not sent from the phone" {
+			n++
+		}
+	}
+	if n != 1 || len(w.rec.Calls) != 0 {
+		t.Fatalf("logged the reason %d time(s), calls=%d; logs %q", n, len(w.rec.Calls), logs)
+	}
+}
+
+// With FromPhone nil the real check runs: the transcript's last prompt is
+// the line the relay typed and the stored session holds it, so the
+// buttons and the alerts go out at once.
+func TestPhoneStartedRealRecordReachesTheHooks(t *testing.T) {
+	at := time.Date(2026, 10, 22, 15, 0, 0, 0, time.UTC)
+	prep := func(h *harness, in *Input) {
+		in.TranscriptPath = writePrompts(t, promptLine{at, " Привет"})
+		s, _ := h.store.LoadSession(sid)
+		s.RecordPhoneLine("Привет", at, false)
+		if err := h.store.SaveSession(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	w := newWaitHarness(t)
+	w.away = false
+	w.deps.AwayIn = func(context.Context) time.Duration { return time.Hour }
+	var logs []string
+	w.deps.Log = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+	w.deps.Watch = func(string, string, json.RawMessage) (Watcher, error) {
+		return pollFunc(func() (bool, error) { return w.mac, nil }), nil
+	}
+	in := load(t, "permission_request_bash.json")
+	prep(w.harness, in)
+	w.onSleep = func() {
+		if len(w.rec.Calls) == 1 {
+			w.mac = true
+		}
+	}
+	waitPermission(context.Background(), in, w.deps)
+	if len(w.rec.Calls) != 1 || !slices.Contains(logs, "permission-wait ("+sid+"): phone-started turn: sending now") {
+		t.Fatalf("calls=%d logs=%q", len(w.rec.Calls), logs)
+	}
+
+	h := newHarness(t)
+	h.away = false
+	in = load(t, "notification_permission.json")
+	prep(h, in)
+	_ = Handle(context.Background(), "notification", in, h.deps)
+	if len(h.rec.Calls) != 1 {
+		t.Fatalf("alert calls=%d", len(h.rec.Calls))
+	}
+}
+
+// Once a dialog of a phone-started turn is answered at the Mac, the
+// owner is there: the turn's next alert waits for the idle time again,
+// and the log says why (ruling P16).
+func TestPhoneStartedEndsWithAMacAnswer(t *testing.T) {
+	w := newWaitHarness(t)
+	at := w.now
+	in := load(t, "permission_request_bash.json")
+	in.TranscriptPath = writePrompts(t, promptLine{at, " Привет"})
+	if _, err := w.store.UpdateSession(sid, func(s *state.Session) { s.RecordPhoneLine("Привет", at, false) }); err != nil {
+		t.Fatal(err)
+	}
+	w.away = false
+	w.deps.AwayIn = func(context.Context) time.Duration { return time.Hour }
+	w.deps.Watch = func(string, string, json.RawMessage) (Watcher, error) {
+		return pollFunc(func() (bool, error) { return w.mac, nil }), nil
+	}
+	w.onSleep = func() {
+		if len(w.rec.Calls) == 1 {
+			w.mac = true // answered at the Mac, the buttons out
+		}
+	}
+	waitPermission(context.Background(), in, w.deps)
+	if len(w.rec.Calls) != 1 {
+		t.Fatalf("calls=%d, want the phone-started turn's buttons", len(w.rec.Calls))
+	}
+
+	// The turn's next alert, from the same store.
+	w.now = w.now.Add(time.Second)
+	var logs []string
+	w.deps.Log = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+	alert := load(t, "notification_permission.json")
+	alert.TranscriptPath = in.TranscriptPath
+	_ = Handle(context.Background(), "notification", alert, w.deps)
+	if len(w.rec.Calls) != 1 || !slices.Contains(logs, "phone check ("+sid+"): answered at the Mac since") {
+		t.Fatalf("calls=%d logs=%q, want the alert held for the Mac answer", len(w.rec.Calls), logs)
 	}
 }
 
@@ -551,6 +817,75 @@ func TestWaitAnsweredAtMacEditsMessage(t *testing.T) {
 	}
 	if w.asksLeft() != 0 {
 		t.Fatal("ask left behind")
+	}
+}
+
+// A dialog the waiting hook sees closed at the Mac is recorded in the
+// session (MacAnswerAt), at the time it decides so, whether the call's
+// result showed (the transcript) or the dialog went (the screen guard):
+// a turn the phone started before it no longer counts as one (ruling
+// P16). A close within 30 s after the relay typed the phone's /approve or
+// /deny fallback came from the phone and records nothing (P20); one 31 s
+// after does. A wait that expires or ends records nothing.
+func TestWaitMacCloseRecordsMacAnswer(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		act    func(w *waitHarness)
+		record bool
+	}{
+		{"the call's result", func(w *waitHarness) { w.mac = true }, true},
+		{"the dialog gone", func(w *waitHarness) { w.shown = termScreen(t, "idle-screen.txt") }, true},
+		// The relay typed the phone's /approve fallback 10 s before: the
+		// dialog closed from the phone (ruling P20).
+		{"the phone's fallback 10 s before", func(w *waitHarness) {
+			w.mac = true
+			_, _ = w.store.UpdateSession(sid, func(s *state.Session) { s.PhoneAnswerAt = w.now.Add(-10 * time.Second) })
+		}, false},
+		{"the phone's fallback 31 s before", func(w *waitHarness) {
+			w.mac = true
+			_, _ = w.store.UpdateSession(sid, func(s *state.Session) { s.PhoneAnswerAt = w.now.Add(-31 * time.Second) })
+		}, true},
+		{"expired", func(*waitHarness) {}, false}, // the deadline, 30 s
+		{"session ended", func(w *waitHarness) {
+			_, _ = w.store.UpdateSession(sid, func(s *state.Session) { s.EndedAt = w.now })
+		}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w := newWaitHarness(t)
+			w.deps.Deadline = 30 * time.Second
+			var acted time.Time
+			w.onSleep = func() {
+				if len(w.rec.Calls) == 1 && acted.IsZero() {
+					acted = w.now
+					c.act(w)
+				}
+			}
+			var logs []string
+			w.deps.Log = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+			waitPermission(context.Background(), load(t, "permission_request_bash.json"), w.deps)
+			s, _ := w.store.LoadSession(sid)
+			if strings.HasPrefix(c.name, "the phone's fallback") && !c.record {
+				if !s.MacAnswerAt.IsZero() || !slices.Contains(logs, "permission-wait ("+sid+"): closed by the phone's /approve or /deny: no answer at the Mac recorded") {
+					t.Fatalf("MacAnswerAt = %v; logs %q", s.MacAnswerAt, logs)
+				}
+				return
+			}
+			if !c.record {
+				if !s.MacAnswerAt.IsZero() || slices.Contains(logs, "permission-wait ("+sid+"): closed: mac") {
+					t.Fatalf("recorded a Mac answer at %v; logs %q", s.MacAnswerAt, logs)
+				}
+				if len(w.edits) != 1 || strings.Contains(w.edits[0].html, "answered at the Mac") {
+					t.Fatalf("edits = %+v, want the message closed as %s", w.edits, c.name)
+				}
+				return
+			}
+			if !slices.Contains(logs, "permission-wait ("+sid+"): closed: mac") {
+				t.Fatalf("logs = %q, want the Mac close", logs)
+			}
+			if s.MacAnswerAt.IsZero() || s.MacAnswerAt.Before(acted) || s.MacAnswerAt.After(w.now) {
+				t.Fatalf("MacAnswerAt = %v, want the close time, between %v and %v", s.MacAnswerAt, acted, w.now)
+			}
+		})
 	}
 }
 
@@ -1061,6 +1396,43 @@ func TestWaitScrubsBotToken(t *testing.T) {
 	}
 }
 
+// The waiting hook's summary is cleaned before it is cut, as the
+// permission request's: a configured secret crossing the cut at
+// summaryMax runes leaves no prefix of itself in the session record, the
+// ask or the messages.
+func TestWaitSummaryCleanedBeforeCut(t *testing.T) {
+	w := newWaitHarness(t)
+	w.deps.Sender.Secrets = []string{testKey}
+	cmd := "echo " + strings.Repeat("a", summaryMax-10) + " " + testKey + " done"
+	in := load(t, "permission_request_bash.json")
+	in.ToolInput = json.RawMessage(`{"command":"` + cmd + `"}`)
+	w.shown = dialogFor(t, cmd)
+	leaks := func(s string) bool { return strings.Contains(s, testKey[:4]) }
+	asked := false
+	w.onSleep = func() {
+		if w.sleeps == 1 {
+			a := w.openAsk(t)
+			asked = true
+			if leaks(a.Summary) || leaks(strings.Join(a.Texts, "")) {
+				t.Errorf("ask summary=%q texts=%q", a.Summary, a.Texts)
+			}
+			w.mac = true
+		}
+	}
+	waitPermission(context.Background(), in, w.deps)
+	if !asked || len(w.rec.Calls) != 1 || leaks(w.rec.Calls[0].Text) {
+		t.Fatalf("asked=%v calls=%+v", asked, w.rec.Calls)
+	}
+	for _, e := range w.edits {
+		if leaks(e.html) {
+			t.Fatalf("edits=%+v", w.edits)
+		}
+	}
+	if s, _ := w.store.LoadSession(sid); s.PendingPermission == nil || leaks(s.PendingPermission.Summary) {
+		t.Fatalf("pending=%+v", s.PendingPermission)
+	}
+}
+
 // An option label holding the bot token is masked in the question's
 // message, its buttons and the stored text the relay edits from.
 func TestWaitScrubsBotTokenInAQuestion(t *testing.T) {
@@ -1470,7 +1842,7 @@ func TestWaitNoPaneNoButtons(t *testing.T) {
 		t.Fatalf("out=%s", out)
 	}
 	assertSkipped(t, w)
-	if waitingHookOwnsDialog(load(t, "notification_permission.json"), w.deps) {
+	if waitingHookOwnsDialog(context.Background(), load(t, "notification_permission.json"), w.deps) {
 		t.Fatal("the 6-second alert would still be silenced")
 	}
 }
@@ -2015,6 +2387,56 @@ func TestWaitStoresOnlyTheSignaturesFingerprint(t *testing.T) {
 	}
 }
 
+// An MCP ask stores its keys (ruling P27) cleaned like every stored text:
+// an argument holding a credential is masked, the other keys are kept.
+func TestWaitStoresMCPKeysMasked(t *testing.T) {
+	const tool = "mcp__claude_ai_AccuWeather__widgets-search-claude"
+	// A bot token is longer than a key keeps of a value (keyLen runes): the
+	// shortened secret would no longer match what cleaning masks.
+	const token = "123456789:AAHfakeTokenForTheTestOnlyQwErTyUiOpAsDfGh"
+	for name, secret := range map[string]string{"a credential": "password=hunter2secret", "the bot token": token} {
+		t.Run(name, func(t *testing.T) {
+			w := newWaitHarness(t)
+			w.deps.Sender.Secrets = []string{token}
+			w.shown = strings.Replace(termScreen(t, "mcp-dialog.txt"), `query: "Paris, France" }`, `query: "Paris, France", auth: "`+secret+`" }`, 1)
+			var file string
+			var keys []string
+			w.onSleep = func() {
+				if w.sleeps == 1 {
+					a := w.openAsk(t)
+					b, err := os.ReadFile(filepath.Join(w.store.Dir, "asks", a.ID+".json"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					file, keys = string(b), a.Keys
+				}
+				if len(w.rec.Calls) > 0 {
+					w.mac = true
+				}
+			}
+			waitPermission(context.Background(), mcpInput(t, tool, `{"queryParams":{"query":"Paris, France","auth":"`+secret+`"}}`), w.deps)
+			if file == "" || strings.Contains(file, secret[:20]) {
+				t.Fatalf("the ask file holds the secret:\n%s", file)
+			}
+			if keys != nil {
+				t.Fatalf("keys=%q, want none for an input holding a secret", keys)
+			}
+			if s, _ := w.store.LoadSession(sid); s.PendingPermission == nil || strings.Contains(s.PendingPermission.Summary, secret[:20]) {
+				t.Fatalf("the session record holds the secret: %+v", s.PendingPermission)
+			}
+			if len(w.rec.Calls) != 1 {
+				t.Fatalf("calls=%d: the hook must still find its dialog", len(w.rec.Calls))
+			}
+		})
+	}
+	// An input without a secret keeps its keys.
+	w := newWaitHarness(t)
+	in := mcpInput(t, tool, `{"queryParams":{"query":"Paris, France"}}`)
+	if keys := askKeys(callKey(tool, in.ToolInput, ""), in.ToolInput, w.deps.Sender.Clean); !slices.Contains(keys, `query:"Paris, France"`) || !slices.Contains(keys, "(MCP)") {
+		t.Fatalf("keys=%q, want the plain ones kept", keys)
+	}
+}
+
 // The phone's answer is collected only once Claude Code has it: the hook
 // returns the decision with a commit that the hook command runs after
 // writing it to stdout. Until then the ask stays, answered and not
@@ -2235,7 +2657,34 @@ func TestCallKey(t *testing.T) {
 		{"Edit", `{}`, callKeys{}},
 		{"WebFetch", `{"url":"not a url"}`, callKeys{}},
 		{questionTool, `{"questions":[]}`, callKeys{}},
-		{"mcp__linear__save_issue", `{"title":"Fix the login"}`, callKeys{}},
+		// An MCP tool (ruling P12): "(MCP)" and every leaf of the input,
+		// nested ones too: a string in quotes (from 40 characters on, an
+		// opening quote and its first 40), a whole number or true/false
+		// as written; under a plain identifier, its name and a colon in
+		// front; an array item or a value under another name, alone.
+		// Numbers and booleans never tie a call to a dialog alone: no
+		// string, no keys (P21).
+		{"mcp__linear__save_issue", `{"title":"Fix the login"}`, callKeys{every: one("(MCP)", `title:"Fix the login"`)}},
+		{"mcp__claude_ai_AccuWeather__widgets-search-claude", `{"queryParams":{"query":"Paris, France"}}`, callKeys{every: one("(MCP)", `query:"Paris, France"`)}},
+		{"mcp__x__y", `{"a":{"b":["one",{"c":"two"}]},"z":"last"}`, callKeys{every: one("(MCP)", `"one"`, `c:"two"`, `z:"last"`)}},
+		{"mcp__x__y", `{"q":"` + strings.Repeat("a", 50) + `"}`, callKeys{every: one("(MCP)", `q:"`+strings.Repeat("a", 40))}},
+		{"mcp__x__y", `{"q":"` + strings.Repeat("é", 39) + `"}`, callKeys{every: one("(MCP)", `q:"`+strings.Repeat("é", 39)+`"`)}},
+		{"mcp__x__y", `{"days":5}`, callKeys{}},
+		{"mcp__x__y", `{"force":true,"dry_run":false,"$top":-12}`, callKeys{}},
+		{"mcp__x__y", `{"q":"x","days":5}`, callKeys{every: one("(MCP)", "days:5", `q:"x"`)}},
+		{"mcp__x__y", `{"q":"x","force":true,"dry_run":false,"$top":-12}`, callKeys{every: one("(MCP)", "$top:-12", "dry_run:false", "force:true", `q:"x"`)}},
+		{"mcp__x__y", `{"ids":[5,7],"on":true}`, callKeys{}},
+		{"mcp__x__y", `{"ids":[5,true,"x",1.5,null]}`, callKeys{every: one("(MCP)", "5", "true", `"x"`)}},
+		{"mcp__x__y", `{"my-key":"v","2nd":7,"ok":"w"}`, callKeys{every: one("(MCP)", "7", `"v"`, `ok:"w"`)}},
+		// A value with a quote, a backslash or a line break is left out,
+		// and so is a float, a null, an empty object or array.
+		{"mcp__x__y", `{"a":"say \"hi\"","b":"c:\\d","c":"one\ntwo","d":"cr\rx","e":"kept"}`, callKeys{every: one("(MCP)", `e:"kept"`)}},
+		{"mcp__x__y", `{"a":"say \"hi\"","b":"one\ntwo"}`, callKeys{}},
+		{"mcp__x__y", `{"f":1.5,"g":1e3,"h":-0.0,"i":2E1,"n":null,"o":{},"l":[]}`, callKeys{}},
+		{"mcp__x__y", `{"empty":"  ","null":null}`, callKeys{}},
+		{"mcp__x__y", `{}`, callKeys{}},
+		{"mcp__x__y", `not json`, callKeys{}},
+		{"mcp__x__y", `{"days":5} {"days":6}`, callKeys{}},
 		{"Bash", `not json`, callKeys{}},
 	}
 	for _, c := range cases {
@@ -2585,6 +3034,447 @@ func TestWaitWriteToANetworkPathGetsButtons(t *testing.T) {
 		waitPermission(context.Background(), in, w.deps)
 		if len(w.rec.Calls) != 1 || len(w.rec.Calls[0].InlineKeyboard) == 0 {
 			t.Errorf("%s: calls=%d, want the button message", name, len(w.rec.Calls))
+		}
+	}
+}
+
+// An MCP call's dialog (Claude Code 2.1.310, the AccuWeather search for
+// "Paris, France") gets buttons when the screen shows "(MCP)" and every
+// string of the call; the same screen against another call's arguments
+// gets none.
+func TestWaitMCPButtons(t *testing.T) {
+	const tool = "mcp__claude_ai_AccuWeather__widgets-search-claude"
+	for _, c := range []struct {
+		name, input string
+		own         bool
+	}{
+		{"its search", `{"queryParams":{"query":"Paris, France"}}`, true},
+		{"another search", `{"queryParams":{"query":"Lyon"}}`, false},
+		{"one of its strings only", `{"queryParams":{"query":"Paris, France","lang":"fr"}}`, false},
+		// A short value is closed by its quote: "Lyon" is not "Lyon, France".
+		{"a value the dialog's value starts", `{"queryParams":{"query":"Paris"}}`, false},
+		// The argument's name is part of the key (ruling P12).
+		{"the same string under another name", `{"queryParams":{"q":"Paris, France"}}`, false},
+		{"the same string under a name the dialog's ends with", `{"queryParams":{"ry":"Paris, France"}}`, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w := newWaitHarness(t)
+			in := load(t, "permission_request_bash.json")
+			in.ToolName, in.ToolInput = tool, json.RawMessage(c.input)
+			in.PermissionSuggestions = json.RawMessage(`[{"type":"addRules","rules":[{"toolName":"` + tool + `"}],"behavior":"allow","destination":"localSettings"}]`)
+			w.shown = termScreen(t, "mcp-dialog.txt")
+			w.onSleep = func() {
+				if len(w.rec.Calls) > 0 {
+					w.mac = true
+				}
+			}
+			var logs []string
+			w.deps.Log = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
+			waitPermission(context.Background(), in, w.deps)
+			if !c.own {
+				if len(w.rec.Calls) != 0 || w.asksLeft() != 0 {
+					t.Fatalf("calls=%d asks=%d, want none", len(w.rec.Calls), w.asksLeft())
+				}
+				return
+			}
+			if len(w.rec.Calls) != 1 || len(w.rec.Calls[0].InlineKeyboard) != 2 {
+				t.Fatalf("calls=%+v, want the button message with the always option", w.rec.Calls)
+			}
+			row := w.rec.Calls[0].InlineKeyboard[0]
+			if len(row) != 2 || !strings.HasPrefix(row[0].Text, "✅") || !strings.HasPrefix(row[1].Text, "❌") {
+				t.Fatalf("first row=%+v, want ✅ and ❌", row)
+			}
+			if kb := w.rec.Calls[0].InlineKeyboard[1]; !strings.Contains(kb[0].Text, "always") {
+				t.Fatalf("second row=%+v, want the always option", kb)
+			}
+		})
+	}
+}
+
+// Two MCP calls differing only in a number or a boolean: each hook adopts
+// only the dialog that shows its own value, whole: "limit: 5" is not
+// "limit: 50", nor "force: true" "force: false".
+func TestWaitMCPNumbersAndBooleans(t *testing.T) {
+	const tool = "mcp__claude_ai_AccuWeather__widgets-search-claude"
+	fixture := termScreen(t, "mcp-dialog.txt")
+	const shown = `queryParams: { query: "Paris, France" }`
+	if !strings.Contains(fixture, shown) {
+		t.Fatal("fixture lacks the arguments to replace")
+	}
+	for _, c := range []struct {
+		name, dialog, input string
+		own                 bool
+	}{
+		{"its limit", `queryParams: { query: "Paris, France", limit: 50 }`, `{"queryParams":{"query":"Paris, France","limit":50}}`, true},
+		{"a limit the dialog's starts", `queryParams: { query: "Paris, France", limit: 50 }`, `{"queryParams":{"query":"Paris, France","limit":5}}`, false},
+		{"a limit starting the dialog's", `queryParams: { query: "Paris, France", limit: 5 }`, `{"queryParams":{"query":"Paris, France","limit":50}}`, false},
+		{"a negative limit", `queryParams: { query: "Paris, France", limit: -5 }`, `{"queryParams":{"query":"Paris, France","limit":5}}`, false},
+		{"a float limit", `queryParams: { query: "Paris, France", limit: 5.5 }`, `{"queryParams":{"query":"Paris, France","limit":5}}`, false},
+		{"its top-level days", `queryParams: { query: "Paris, France" }, days: 5`, `{"queryParams":{"query":"Paris, France"},"days":5}`, true},
+		{"its force", `queryParams: { query: "Paris, France" }, force: true`, `{"queryParams":{"query":"Paris, France"},"force":true}`, true},
+		{"another force", `queryParams: { query: "Paris, France" }, force: false`, `{"queryParams":{"query":"Paris, France"},"force":true}`, false},
+		{"its id in an array", `queryParams: { query: "Paris, France", ids: [ 7, 12 ] }`, `{"queryParams":{"query":"Paris, France","ids":[7,12]}}`, true},
+		{"an id the dialog's starts", `queryParams: { query: "Paris, France", ids: [ 70, 12 ] }`, `{"queryParams":{"query":"Paris, France","ids":[7,12]}}`, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w := newWaitHarness(t)
+			in := load(t, "permission_request_bash.json")
+			in.ToolName, in.ToolInput = tool, json.RawMessage(c.input)
+			w.shown = strings.Replace(fixture, shown, c.dialog, 1)
+			w.onSleep = func() {
+				if len(w.rec.Calls) > 0 {
+					w.mac = true
+				}
+			}
+			waitPermission(context.Background(), in, w.deps)
+			if got := len(w.rec.Calls) == 1; got != c.own {
+				t.Fatalf("sent=%v, want %v (keys %q)", got, c.own, callKey(tool, in.ToolInput, ""))
+			}
+		})
+	}
+}
+
+// An MCP key is found only standing alone where it starts or ends with a
+// word character: a name is not the end of a longer one, a number or a
+// boolean not the start of a longer one. A string's key ends at its
+// quote; a long one's start is a prefix by design.
+func TestHasArg(t *testing.T) {
+	for _, c := range []struct {
+		sig, key string
+		want     bool
+	}{
+		{`─queryParams:{query:"Paris,France"}─`, `query:"Paris, France"`, true},
+		{`─queryParams:{subquery:"Paris,France"}─`, `query:"Paris, France"`, false},
+		{`─queryParams:{my-query:"Paris,France"}─`, `query:"Paris, France"`, false},
+		{`─a:{limit:50}─`, "limit:5", false},
+		{`─a:{limit:5,b:1}─`, "limit:5", true},
+		{`─a:{limit:5}─`, "limit:5", true},
+		{`─a:{limit:5.5}─`, "limit:5", false},
+		{`─a:[5,7]─`, "5", true},
+		{`─a:[15,7]─`, "5", false},
+		{`─a:[-5,7]─`, "5", false},
+		{`─Returnsupto5items─`, "5", false},
+		{`─force:true─`, "force:true", true},
+		{`─force:trueish─`, "force:true", false},
+		{`─q:"aaaa"─`, `"aaa`, true},
+		{`─q:"aaaab"─`, `q:"aaaa`, true},
+		{`─xq:"aaaab"─`, `q:"aaaa`, false},
+		{`─Tool:(MCP)─`, "(MCP)", true},
+		{`─a:5─b:limit:5─`, "limit:5", true}, // a later spelling stands alone
+		{`─a─`, "", false},
+	} {
+		if got := hasArg(c.sig, c.key); got != c.want {
+			t.Errorf("hasArg(%q, %q) = %v, want %v", c.sig, c.key, got, c.want)
+		}
+	}
+}
+
+// The second capture (Claude Code 2.1.310, the AccuWeather daily
+// forecast) prints several arguments inline, comma-separated: each key
+// stands alone there, so its own call is adopted; a call differing only in
+// one argument is not. A call whose keys are a subset of the dialog's (the
+// location key alone) is adopted, as every one of its keys shows: the
+// residual the spec names for calls with the same strings.
+func TestWaitMCPInlineArguments(t *testing.T) {
+	const tool = "mcp__claude_ai_AccuWeather__widgets-daily-claude"
+	for _, c := range []struct {
+		name, input string
+		own         bool
+	}{
+		{"its forecast", `{"queryParams":{"locationKey":"2608456","unit":"metric","lang":"en"}}`, true},
+		{"another unit", `{"queryParams":{"locationKey":"2608456","unit":"imperial","lang":"en"}}`, false},
+		{"another location", `{"queryParams":{"locationKey":"2608457","unit":"metric","lang":"en"}}`, false},
+		{"the location key alone", `{"queryParams":{"locationKey":"2608456"}}`, true},
+		{"its forecast and a day count", `{"queryParams":{"locationKey":"2608456","unit":"metric","lang":"en","days":5}}`, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w := newWaitHarness(t)
+			in := load(t, "permission_request_bash.json")
+			in.ToolName, in.ToolInput = tool, json.RawMessage(c.input)
+			w.shown = termScreen(t, "mcp-multiarg-dialog.txt")
+			w.onSleep = func() {
+				if len(w.rec.Calls) > 0 {
+					w.mac = true
+				}
+			}
+			waitPermission(context.Background(), in, w.deps)
+			if got := len(w.rec.Calls) == 1; got != c.own {
+				t.Fatalf("sent=%v, want %v (keys %q)", got, c.own, callKey(tool, in.ToolInput, ""))
+			}
+		})
+	}
+}
+
+// Two queued MCP prompts whose values start alike: the hook for "Lyon"
+// never adopts the dialog of "Lyon, France"; the hook for "Lyon, France"
+// does.
+func TestWaitMCPPrefixValues(t *testing.T) {
+	const tool = "mcp__claude_ai_AccuWeather__widgets-search-claude"
+	screen := strings.Replace(termScreen(t, "mcp-dialog.txt"), `query: "Paris, France"`, `query: "Lyon, France"`, 1)
+	if !strings.Contains(screen, "Lyon, France") {
+		t.Fatal("fixture lacks the value to replace")
+	}
+	for _, c := range []struct {
+		query string
+		own   bool
+	}{{"Lyon", false}, {"Lyon, France", true}} {
+		w := newWaitHarness(t)
+		in := load(t, "permission_request_bash.json")
+		in.ToolName, in.ToolInput = tool, json.RawMessage(`{"queryParams":{"query":"`+c.query+`"}}`)
+		w.shown = screen
+		w.onSleep = func() {
+			if len(w.rec.Calls) > 0 {
+				w.mac = true
+			}
+		}
+		waitPermission(context.Background(), in, w.deps)
+		if got := len(w.rec.Calls) == 1; got != c.own {
+			t.Errorf("query %q: sent=%v, want %v", c.query, got, c.own)
+		}
+	}
+}
+
+// The AccuWeather calls of the live test of 2026-10-26: two made at once
+// wait on one dialog, the current weather shown first (mcp-queue-1of2.txt),
+// the forecast behind it (mcp-queue-2of2.txt once the first is answered).
+const (
+	currentTool     = "mcp__claude_ai_AccuWeather__widgets-current-claude"
+	currentInput    = `{"queryParams":{"locationKey":"2608456","unit":"metric","lang":"en"}}`
+	forecastTool    = "mcp__claude_ai_AccuWeather__widgets-todayTonightForecast-claude"
+	forecastInput   = `{"queryParams":{"locationKey":"2608456","unit":"metric","lang":"en","days":1}}`
+	queueAnsweredIn = time.Minute // the dialog before the call's is answered
+)
+
+func mcpInput(t *testing.T, tool, input string) *Input {
+	t.Helper()
+	in := load(t, "permission_request_bash.json")
+	in.ToolName, in.ToolInput = tool, json.RawMessage(input)
+	in.PermissionSuggestions = json.RawMessage(`[{"type":"addRules","rules":[{"toolName":"` + tool + `"}],"behavior":"allow","destination":"localSettings"}]`)
+	return in
+}
+
+// A call queued behind the dialog shown keeps looking past dialogWait
+// while the pane shows calls queued, and its buttons go out once its own
+// dialog comes up. In the live test the hook gave up after three seconds.
+func TestWaitQueuedBehindAnotherCall(t *testing.T) {
+	w := newWaitHarness(t)
+	w.away = true
+	w.shown = termScreen(t, "mcp-queue-1of2.txt")
+	start, sentAt := w.now, time.Time{}
+	w.onSleep = func() {
+		if w.now.Sub(start) >= queueAnsweredIn {
+			w.shown = termScreen(t, "mcp-queue-2of2.txt")
+		}
+		if len(w.rec.Calls) > 0 && sentAt.IsZero() {
+			sentAt, w.mac = w.now, true
+		}
+	}
+	var logs []string
+	w.deps.Log = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
+	waitPermission(context.Background(), mcpInput(t, forecastTool, forecastInput), w.deps)
+	if len(w.rec.Calls) != 1 || len(w.rec.Calls[0].InlineKeyboard) == 0 || !strings.Contains(w.rec.Calls[0].Text, "todayTonightForecast") {
+		t.Fatalf("calls=%+v, want the forecast's button message", w.rec.Calls)
+	}
+	if got := sentAt.Sub(start); got < queueAnsweredIn || got > queueAnsweredIn+2*time.Second {
+		t.Errorf("sent %v after the request, want once its dialog came up at %v", got, queueAnsweredIn)
+	}
+	if s := strings.Join(logs, "\n"); strings.Contains(s, "no buttons") {
+		t.Errorf("logs:\n%s", s)
+	}
+}
+
+// A queued call whose dialog never comes up gives up dialogWait after the
+// pane last showed calls queued (all answered or cancelled at the Mac), and
+// one answered at the Mac while queued stops looking at once. Neither sends
+// anything, and the ask goes.
+func TestWaitQueuedCallNeverShown(t *testing.T) {
+	for name, gone := range map[string]func(w *waitHarness){
+		"queue gone":          func(w *waitHarness) { w.shown = termScreen(t, "idle-screen.txt") },
+		"answered at the Mac": func(w *waitHarness) { w.mac = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newWaitHarness(t)
+			w.away = true
+			w.shown = termScreen(t, "mcp-queue-1of2.txt")
+			start := w.now
+			w.onSleep = func() {
+				if w.now.Sub(start) >= queueAnsweredIn {
+					gone(w)
+				}
+			}
+			var logs []string
+			w.deps.Log = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
+			waitPermission(context.Background(), mcpInput(t, forecastTool, forecastInput), w.deps)
+			if len(w.rec.Calls) != 0 || w.asksLeft() != 0 {
+				t.Fatalf("calls=%d asks=%d, want none", len(w.rec.Calls), w.asksLeft())
+			}
+			if got := w.now.Sub(start); got < queueAnsweredIn || got > queueAnsweredIn+dialogWait+2*time.Second {
+				t.Errorf("gave up %v after the request, want by %v", got, queueAnsweredIn+dialogWait)
+			}
+			if s := strings.Join(logs, "\n"); !strings.Contains(s, "no buttons") {
+				t.Errorf("logs:\n%s", s)
+			}
+		})
+	}
+}
+
+// The dialog a hook adopted gains the queue counter when a second call
+// joins, and moves it when a call behind it is answered: the dialog is
+// still there, and the phone's answer still reaches Claude. In the live
+// test the hook closed as answered at the Mac and the tap went nowhere.
+func TestWaitDialogJoinedByAQueue(t *testing.T) {
+	queued := termScreen(t, "mcp-queue-1of2.txt")
+	w := newWaitHarness(t)
+	w.away = true
+	w.shown = strings.Replace(queued, "1 of 2", "      ", 1)
+	var answerAt time.Time
+	w.onSleep = func() {
+		switch {
+		case len(w.rec.Calls) == 0:
+		case answerAt.IsZero():
+			w.shown, answerAt = queued, w.now.Add(time.Minute)
+		case w.now.Before(answerAt):
+		default:
+			w.shown = strings.Replace(queued, "1 of 2", "2 of 3", 1)
+			a := w.openAsk(t)
+			if _, err := w.store.UpdateAsk(a.ID, func(a *state.Ask) error {
+				a.Decision = &state.Decision{Behavior: "allow", Suggestion: -1}
+				a.Done = true
+				return nil
+			}); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	out := waitPermission(context.Background(), mcpInput(t, currentTool, currentInput), w.deps)
+	if want := `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}`; string(out) != want {
+		t.Fatalf("out=%s edits=%+v\nwant %s", out, w.edits, want)
+	}
+}
+
+// Ruling P27: the current weather's keys are all in the forecast's dialog,
+// which shows a day count too. While the forecast's hook still looks for its
+// dialog, the current weather's hook leaves it alone and waits for its own;
+// a forecast hook that is gone leaves the old rule: the keys are shown.
+func TestWaitYieldsToTheCallWithMoreKeys(t *testing.T) {
+	forecastFirst := strings.Replace(termScreen(t, "mcp-queue-2of2.txt"), "2 of 2", "1 of 2", 1)
+	currentNext := strings.Replace(termScreen(t, "mcp-queue-1of2.txt"), "1 of 2", "2 of 2", 1)
+	for name, c := range map[string]struct {
+		forecastAlive bool
+		wantAt        time.Duration // when the current weather's buttons go out
+	}{
+		"the forecast's hook looking": {true, queueAnsweredIn},
+		"the forecast's hook gone":    {false, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newWaitHarness(t)
+			w.away = true
+			w.alive = func(pid int) bool { return pid != 4243 || c.forecastAlive }
+			if err := w.store.PutAsk(&state.Ask{ID: state.NewAskID(), SessionID: sid, Tool: forecastTool, HookPID: 4243, Created: w.now,
+				Keys: callKey(forecastTool, json.RawMessage(forecastInput), "").every}); err != nil {
+				t.Fatal(err)
+			}
+			w.shown = forecastFirst
+			start, sentAt := w.now, time.Time{}
+			w.onSleep = func() {
+				if w.now.Sub(start) >= queueAnsweredIn {
+					w.shown = currentNext
+				}
+				if len(w.rec.Calls) > 0 && sentAt.IsZero() {
+					sentAt, w.mac = w.now, true
+				}
+			}
+			waitPermission(context.Background(), mcpInput(t, currentTool, currentInput), w.deps)
+			if len(w.rec.Calls) != 1 || !strings.Contains(w.rec.Calls[0].Text, "widgets-current") {
+				t.Fatalf("calls=%+v, want the current weather's button message", w.rec.Calls)
+			}
+			if got := sentAt.Sub(start); got < c.wantAt || got > c.wantAt+2*time.Second {
+				t.Errorf("sent %v after the request, want at %v", got, c.wantAt)
+			}
+		})
+	}
+}
+
+// A queued call stops looking once its session ends: a crash that leaves
+// the queue on the pane must not keep the hook polling until its deadline.
+func TestWaitQueuedSessionEnds(t *testing.T) {
+	w := newWaitHarness(t)
+	w.away = true
+	w.shown = termScreen(t, "mcp-queue-1of2.txt")
+	_, _ = w.store.UpdateSession(sid, func(s *state.Session) { s.PID = 4242 })
+	start := w.now
+	w.alive = func(pid int) bool { return pid != 4242 || w.now.Sub(start) < queueAnsweredIn }
+	var logs []string
+	w.deps.Log = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
+	waitPermission(context.Background(), mcpInput(t, forecastTool, forecastInput), w.deps)
+	if len(w.rec.Calls) != 0 || w.asksLeft() != 0 {
+		t.Fatalf("calls=%d asks=%d, want none", len(w.rec.Calls), w.asksLeft())
+	}
+	if got := w.now.Sub(start); got < queueAnsweredIn || got > queueAnsweredIn+2*time.Second {
+		t.Errorf("gave up %v after the request, want at %v", got, queueAnsweredIn)
+	}
+	if s := strings.Join(logs, "\n"); !strings.Contains(s, "session ended while queued") {
+		t.Errorf("logs:\n%s", s)
+	}
+}
+
+// Keys compare as sets: a call repeating a value has fewer keys
+// than one with the same value and another, whatever the counts. The call
+// repeating "Paris" leaves the dialog showing "Paris" and "Lyon" to the
+// call it belongs to, and gets its own once that is answered.
+func TestWaitYieldsComparesKeySets(t *testing.T) {
+	const tool = "mcp__claude_ai_Example__lookup"
+	queued := termScreen(t, "mcp-queue-1of2.txt")
+	const shown = `queryParams: { locationKey: "2608456", unit: "metric", lang: "en" }`
+	if !strings.Contains(queued, shown) {
+		t.Fatal("fixture lacks the arguments to replace")
+	}
+	for name, c := range map[string]struct {
+		ours, theirs             string
+		oursDialog, theirsDialog string
+	}{
+		"a repeated array item": {`{"items":["Paris","Paris"]}`, `{"items":["Paris","Lyon"]}`,
+			`items: [ "Paris", "Paris" ]`, `items: [ "Paris", "Lyon" ]`},
+		"a repeated nested leaf": {`{"a":{"q":"Paris"},"b":{"q":"Paris"}}`, `{"a":{"q":"Paris"},"b":{"q":"Lyon"}}`,
+			`a: { q: "Paris" }, b: { q: "Paris" }`, `a: { q: "Paris" }, b: { q: "Lyon" }`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newWaitHarness(t)
+			w.away = true
+			w.alive = func(int) bool { return true }
+			theirs := mcpInput(t, tool, c.theirs)
+			if err := w.store.PutAsk(&state.Ask{ID: state.NewAskID(), SessionID: sid, Tool: tool, HookPID: 4243, Created: w.now,
+				Keys: askKeys(callKey(tool, theirs.ToolInput, ""), theirs.ToolInput, render.Redact)}); err != nil {
+				t.Fatal(err)
+			}
+			w.shown = strings.Replace(queued, shown, c.theirsDialog, 1)
+			start, sentAt := w.now, time.Time{}
+			w.onSleep = func() {
+				if w.now.Sub(start) >= queueAnsweredIn {
+					w.shown = strings.Replace(strings.Replace(queued, shown, c.oursDialog, 1), "1 of 2", "2 of 2", 1)
+				}
+				if len(w.rec.Calls) > 0 && sentAt.IsZero() {
+					sentAt, w.mac = w.now, true
+				}
+			}
+			waitPermission(context.Background(), mcpInput(t, tool, c.ours), w.deps)
+			if got := sentAt.Sub(start); len(w.rec.Calls) != 1 || got < queueAnsweredIn || got > queueAnsweredIn+2*time.Second {
+				t.Fatalf("calls=%d sent %v after the request, want one at %v", len(w.rec.Calls), got, queueAnsweredIn)
+			}
+		})
+	}
+}
+
+// Each MCP key comes once, in the order it first comes: a repeated value or
+// leaf proves nothing more, and keys compare as sets (ruling P27).
+func TestMCPKeysOnceEach(t *testing.T) {
+	for input, want := range map[string][]string{
+		`{"items":["Paris","Paris"]}`:                            {"(MCP)", `"Paris"`},
+		`{"a":{"q":"Paris"},"b":{"q":"Paris"}}`:                  {"(MCP)", `q:"Paris"`},
+		`{"a":{"q":"Paris"},"b":{"q":"Lyon"},"c":{"q":"Paris"}}`: {"(MCP)", `q:"Paris"`, `q:"Lyon"`},
+	} {
+		if got := callKey("mcp__claude_ai_Example__lookup", json.RawMessage(input), "").every; !slices.Equal(got, want) {
+			t.Errorf("%s: keys=%q, want %q", input, got, want)
 		}
 	}
 }

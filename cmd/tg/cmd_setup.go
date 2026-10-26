@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/IZZY-Agency/claude-tg/internal/assets"
+	"github.com/IZZY-Agency/claude-tg/internal/classify"
 	"github.com/IZZY-Agency/claude-tg/internal/config"
 	"github.com/IZZY-Agency/claude-tg/internal/send"
 	"github.com/IZZY-Agency/claude-tg/internal/settings"
@@ -25,7 +26,7 @@ import (
 )
 
 func init() {
-	register("setup", "configure the bot and install the skill, hooks and allow rules: tg setup [--token t] [--chat-id id] [--yes] [--check] [--no-claude-md] [--force]", cmdSetup)
+	register("setup", "configure the bot and install the skill, hooks and allow rules: tg setup [--token t] [--chat-id id] [--typesafe-key k] [--yes] [--check] [--no-claude-md] [--force]", cmdSetup)
 }
 
 // claudeHomeDir is ~/.claude unless TG_CLAUDE_HOME (tests) or CLAUDE_CONFIG_DIR says otherwise.
@@ -179,6 +180,7 @@ func cmdSetup(c *cli, args []string) int {
 	fs.SetOutput(c.stderr)
 	tokenFlag := fs.String("token", "", "bot token from @BotFather")
 	chatFlag := fs.Int64("chat-id", 0, "Telegram chat id (skips discovery)")
+	keyFlag := fs.String("typesafe-key", "", "TypeSafe API key for choosing spoken answers")
 	yes := fs.Bool("yes", false, "assume yes to every question")
 	check := fs.Bool("check", false, "report what is installed; change nothing")
 	noClaudeMD := fs.Bool("no-claude-md", false, "do not touch ~/.claude/CLAUDE.md")
@@ -243,6 +245,9 @@ func cmdSetup(c *cli, args []string) int {
 	// 3. Validate the token.
 	ctx := context.Background()
 	client := telegram.New(token)
+	if setupTelegramBaseURL != "" {
+		client.BaseURL = setupTelegramBaseURL
+	}
 	me, err := client.GetMe(ctx)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "tg setup: token rejected by Telegram: %v\n", err)
@@ -263,17 +268,21 @@ func cmdSetup(c *cli, args []string) int {
 		chatID, userID = id, uid
 	}
 
+	// 4b. TypeSafe key (optional).
+	var cfgKey string
+	if existing != nil {
+		cfgKey = existing.TypesafeAPIKey
+	}
+	hasSpeech := existing != nil && existing.SpeechCommand != ""
+	typesafeKey := setupTypesafeKey(c, ctx, *keyFlag, cfgKey, tty, *yes, hasSpeech)
+
 	// 5. Config.
 	cfg := &config.Config{
 		BotToken: token, ChatID: chatID, UserID: userID, BotUsername: me.Username,
 		ClaudePath: findClaude(), BinaryPath: bin, AwayAfterSeconds: config.DefaultAwayAfterSeconds, InstalledAt: time.Now(),
 	}
-	if existing != nil {
-		cfg.AwayAfterSeconds = existing.AwayAfterSeconds
-		if !existing.InstalledAt.IsZero() {
-			cfg.InstalledAt = existing.InstalledAt
-		}
-	}
+	carryOver(cfg, existing)
+	cfg.TypesafeAPIKey = typesafeKey
 	if err := cfg.Save(p.config); err != nil {
 		fmt.Fprintf(c.stderr, "tg setup: write config: %v\n", err)
 		return exitUsage
@@ -354,6 +363,71 @@ func cmdSetup(c *cli, args []string) int {
 	fmt.Fprintln(c.stdout, "Sent a test message. Done.")
 	return exitOK
 }
+
+// classifyBaseURL and setupTelegramBaseURL are test seams: "" means the real
+// TypeSafe and Telegram endpoints.
+var (
+	classifyBaseURL      string
+	setupTelegramBaseURL string
+)
+
+// setupTypesafeKey picks the optional TypeSafe key (flag, then
+// TYPESAFE_API_KEY, then the existing config, then a prompt on a terminal),
+// checks it and returns what to save: "" when there is none or it was
+// rejected. The key is never printed.
+func setupTypesafeKey(c *cli, ctx context.Context, flagKey, cfgKey string, tty, yes, hasSpeech bool) string {
+	key := chooseTypesafeKey(strings.TrimSpace(flagKey), strings.TrimSpace(c.env("TYPESAFE_API_KEY")), cfgKey, tty, yes,
+		func() bool { return ask(c, "A TypeSafe API key is already configured. Reuse it?", true) },
+		func() string {
+			fmt.Fprint(c.stdout, typesafePrompt)
+			return readSecret(c)
+		})
+	if key == "" {
+		return ""
+	}
+	err := (&classify.Client{Key: key, BaseURL: classifyBaseURL}).Check(ctx)
+	switch {
+	case err == nil:
+		fmt.Fprintln(c.stdout, "TypeSafe: key accepted")
+		unusedNote(c, hasSpeech)
+		return key
+	case errors.Is(err, classify.ErrRejected):
+		fmt.Fprintln(c.stdout, "TypeSafe: key rejected; not saved")
+		return ""
+	default:
+		fmt.Fprintf(c.stdout, "TypeSafe: could not check the key (%s); saved anyway\n", strings.TrimPrefix(err.Error(), "typesafe: "))
+		unusedNote(c, hasSpeech)
+		return key
+	}
+}
+
+// unusedNote tells that a saved key does nothing until speech is configured.
+func unusedNote(c *cli, hasSpeech bool) {
+	if !hasSpeech {
+		fmt.Fprintln(c.stdout, "TypeSafe: used once speech_command is set (see the README)")
+	}
+}
+
+// chooseTypesafeKey picks the key: flag, then env, then the existing config
+// key, then a prompt on a terminal. With yes nothing is asked: an existing
+// key is kept and without one there is none. On a terminal an existing key
+// is kept only if askReuse says so; otherwise readKey is asked for a new
+// one, and an empty answer leaves none.
+func chooseTypesafeKey(flagKey, envKey, cfgKey string, tty, yes bool, askReuse func() bool, readKey func() string) string {
+	switch {
+	case flagKey != "":
+		return flagKey
+	case envKey != "":
+		return envKey
+	case yes || !tty:
+		return cfgKey
+	case cfgKey != "" && askReuse():
+		return cfgKey
+	}
+	return readKey()
+}
+
+const typesafePrompt = "TypeSafe API key for choosing spoken answers (optional, Enter to skip): "
 
 func doneWord(changed bool) string {
 	if changed {
@@ -462,6 +536,25 @@ func setupCheck(c *cli, p paths, existing *config.Config, bin string) int {
 	} else {
 		fmt.Fprintln(c.stdout, "relay: not installed (tg relay install)")
 	}
+	if existing != nil && existing.VoiceCommand != "" {
+		fmt.Fprintln(c.stdout, "voice: configured")
+	} else {
+		fmt.Fprintln(c.stdout, "voice: not configured (see the README)")
+	}
+	if existing != nil && existing.SpeechCommand != "" {
+		fmt.Fprintln(c.stdout, "speech: configured")
+	} else {
+		fmt.Fprintln(c.stdout, "speech: not configured (see the README)")
+	}
+	if existing != nil && existing.TypesafeAPIKey != "" {
+		if existing.SpeechCommand == "" {
+			fmt.Fprintln(c.stdout, "classifier: configured (TypeSafe), unused until speech_command is set")
+		} else {
+			fmt.Fprintln(c.stdout, "classifier: configured (TypeSafe)")
+		}
+	} else {
+		fmt.Fprintln(c.stdout, "classifier: not configured (typed answers are never spoken)")
+	}
 	fmt.Fprintln(c.stdout, backendsLine("none (replies unavailable)"))
 	if entries, err := os.ReadDir(filepath.Join(stateDir(c), "spool")); err == nil {
 		n := 0
@@ -553,6 +646,20 @@ func replaceFile(path string, data []byte) error {
 		return err
 	}
 	return nil
+}
+
+// carryOver copies the settings a re-run of setup must not reset from the
+// previous config into the freshly built one.
+func carryOver(cfg, existing *config.Config) {
+	if existing == nil {
+		return
+	}
+	cfg.AwayAfterSeconds = existing.AwayAfterSeconds
+	if !existing.InstalledAt.IsZero() {
+		cfg.InstalledAt = existing.InstalledAt
+	}
+	cfg.VoiceCommand = existing.VoiceCommand
+	cfg.SpeechCommand = existing.SpeechCommand
 }
 
 func fileExists(p string) bool {

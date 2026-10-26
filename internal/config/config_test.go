@@ -4,6 +4,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -65,5 +67,105 @@ func TestDefaultPathsHonourXDG(t *testing.T) {
 	}
 	if StateDir() != "/tmp/xs/claude-tg" {
 		t.Fatalf("StateDir=%q", StateDir())
+	}
+}
+
+func TestVoiceCommandRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "claude-tg", "config.json")
+	want := &Config{BotToken: "123:abc", ChatID: 1, VoiceCommand: `whisper-cli "$TG_VOICE_FILE"`}
+	if err := want.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.VoiceCommand != want.VoiceCommand {
+		t.Fatalf("VoiceCommand=%q, want %q", got.VoiceCommand, want.VoiceCommand)
+	}
+	bare := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(bare, []byte(`{"bot_token":"1:x","chat_id":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err = Load(bare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.VoiceCommand != "" {
+		t.Fatalf("absent key loaded as %q", got.VoiceCommand)
+	}
+}
+
+func TestSpeechCommandRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "claude-tg", "config.json")
+	want := &Config{BotToken: "123:abc", ChatID: 1, SpeechCommand: `say-it "$TG_SPEECH_FILE"`}
+	if err := want.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SpeechCommand != want.SpeechCommand {
+		t.Fatalf("SpeechCommand=%q, want %q", got.SpeechCommand, want.SpeechCommand)
+	}
+	empty := filepath.Join(t.TempDir(), "config.json")
+	if err := (&Config{BotToken: "1:x", ChatID: 1}).Save(empty); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "speech_command") {
+		t.Fatalf("empty speech_command written: %s", b)
+	}
+}
+
+func TestConfigTypesafeKeyRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "claude-tg", "config.json")
+	want := &Config{BotToken: "123:abc", ChatID: 1, TypesafeAPIKey: "k-test"}
+	if err := want.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TypesafeAPIKey != want.TypesafeAPIKey {
+		t.Fatalf("TypesafeAPIKey=%q, want %q", got.TypesafeAPIKey, want.TypesafeAPIKey)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(b), `"typesafe_api_key"`) {
+		t.Fatalf("file lacks typesafe_api_key: %s, %v", b, err)
+	}
+	empty := filepath.Join(t.TempDir(), "config.json")
+	if err := (&Config{BotToken: "1:x", ChatID: 1}).Save(empty); err != nil {
+		t.Fatal(err)
+	}
+	b, err = os.ReadFile(empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "typesafe_api_key") {
+		t.Fatalf("empty typesafe_api_key written: %s", b)
+	}
+}
+
+// Secrets are the configured values no message may show: the bot token
+// and the TypeSafe key, those that are set.
+func TestConfigSecrets(t *testing.T) {
+	for _, tc := range []struct {
+		cfg  Config
+		want []string
+	}{
+		{Config{BotToken: "123:abc", TypesafeAPIKey: "k-test"}, []string{"123:abc", "k-test"}},
+		{Config{BotToken: "123:abc"}, []string{"123:abc"}},
+		{Config{TypesafeAPIKey: "k-test"}, []string{"k-test"}},
+		{Config{}, nil},
+	} {
+		if got := tc.cfg.Secrets(); !slices.Equal(got, tc.want) {
+			t.Errorf("Secrets() of %+v = %q, want %q", tc.cfg, got, tc.want)
+		}
 	}
 }

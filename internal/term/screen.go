@@ -2,6 +2,8 @@ package term
 
 import (
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -97,24 +99,87 @@ func PermissionSignature(screen string) string {
 // under the dialog does not shift it, and holds only the question.
 // Neither the plan approval nor a question picker is a permission dialog,
 // whatever the plan says or the question asks (rulings R32, R38).
+//
+// Parallel calls wait on one dialog: it shows the first call not yet
+// answered, with a queue counter on its title line (see queue). The
+// signature leaves the counter out: a call joining the queue, or one
+// behind the dialog answered, moves it while the dialog stays.
 func PermissionDialog(screen string) (sig string, whole bool) {
-	if PlanApproval(screen) || PickerSignature(screen) != "" {
+	return permissionSig(screen, true)
+}
+
+// permissionSig is PermissionDialog, with the queue counter left out of the
+// signature or kept in it.
+func permissionSig(screen string, dropQueue bool) (sig string, whole bool) {
+	lines, from, opt, whole := permissionDialog(screen)
+	if lines == nil {
 		return "", false
 	}
-	lines := strings.Split(screen, "\n")
+	head := slices.Clone(lines[from:opt])
+	if whole && dropQueue {
+		head[0], _, _ = queue(head[0])
+	}
+	return compact(head), whole
+}
+
+// permissionDialog finds the permission dialog at the bottom of the screen
+// (PermissionDialog): the screen's lines, the dialog's first line (its
+// title, under its top border, when whole; else its question) and its
+// first option. nil lines when there is none.
+func permissionDialog(screen string) (lines []string, from, opt int, whole bool) {
+	if PlanApproval(screen) || PickerSignature(screen) != "" {
+		return nil, 0, 0, false
+	}
+	lines = strings.Split(screen, "\n")
 	q := lastQuestion(lines)
 	if q < 0 || !below(lines[q+1:], optionRe) {
-		return "", false
+		return nil, 0, 0, false
 	}
-	opt := q + 1 // the question may wrap onto the lines before the first option
+	opt = q + 1 // the question may wrap onto the lines before the first option
 	for !optionRe.MatchString(lines[opt]) {
 		opt++
 	}
-	from := topBorder(lines, q) + 1
+	from = topBorder(lines, q) + 1
 	if from == 0 {
-		return compact(lines[q:opt]), false
+		return lines, q, opt, false
 	}
-	return compact(lines[from:opt]), true
+	return lines, from, opt, true
+}
+
+// queueRe is the counter Claude Code 2.1.310 right-aligns on a permission
+// dialog's title line while parallel calls wait on one dialog ("Tool use
+// … 1 of 2", mcp-queue-*.txt): the calls answered, plus one, of all of
+// them. It counts progress, not the call shown: a call behind the dialog
+// answered by its hook moves it while the dialog stays.
+var queueRe = regexp.MustCompile(`^(.*\S)\s+([1-9][0-9]{0,3}) of ([1-9][0-9]{0,3})\s*$`)
+
+// queue reads the counter off a dialog's title line: the line without it,
+// and how many calls are still to answer behind the one shown (0 for the
+// last of them, or a line without a counter).
+func queue(title string) (rest string, behind int, ok bool) {
+	g := queueRe.FindStringSubmatch(title)
+	if g == nil {
+		return title, 0, false
+	}
+	k, _ := strconv.Atoi(g[2])
+	m, _ := strconv.Atoi(g[3])
+	if k > m || m < 2 {
+		return title, 0, false
+	}
+	return g[1], m - k, true
+}
+
+// DialogQueued reports whether the permission dialog at the bottom of the
+// screen, read whole, has calls queued behind it, still to answer: its
+// queue counter's first number is below its second. A queued call's own
+// dialog comes up only once the ones before it are answered.
+func DialogQueued(screen string) bool {
+	lines, from, _, whole := permissionDialog(screen)
+	if lines == nil || !whole {
+		return false
+	}
+	_, behind, _ := queue(lines[from])
+	return behind > 0
 }
 
 // lastQuestion is the index of the last "Do you want to …" line; -1 when
@@ -197,7 +262,12 @@ const bashFooter = "Esc to cancel · Tab to amend"
 // too narrow for PickerSignature's footer), or a directory name with a
 // newline in an Edit dialog's "always allow access to" option. Read and
 // MCP tool dialogs share the layout. The signature is
-// PermissionSignature's; "" for any other screen.
+// PermissionSignature's with the queue counter kept (ruling P26): the
+// relay's two reads must see the same call at the same place in a queue,
+// so an answer at the Mac between them that brings up an identical call
+// stops the keystroke. A dialog whose top border is above the read gets
+// none: its signature is only its question, alike for any two such
+// dialogs. "" for any other screen.
 func BashDialog(screen string) string {
 	lines := strings.Split(screen, "\n")
 	q := lastQuestion(lines)
@@ -211,7 +281,11 @@ func BashDialog(screen string) string {
 	if strings.TrimSpace(lines[last]) != bashFooter || PickerSignature(screen) != "" || PlanMarker(screen) {
 		return ""
 	}
-	return PermissionSignature(screen)
+	sig, whole := permissionSig(screen, false)
+	if !whole {
+		return ""
+	}
+	return sig
 }
 
 // PickerSignature identifies the AskUserQuestion picker at the bottom of the

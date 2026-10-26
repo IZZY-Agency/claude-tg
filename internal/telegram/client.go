@@ -8,8 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -72,11 +76,18 @@ func (c *Client) call(ctx context.Context, method string, params any, out any) e
 		}
 		body = bytes.NewReader(b)
 	}
+	return c.post(ctx, method, body, "application/json", out)
+}
+
+// post sends body to a Bot API method and decodes the envelope into out. The
+// errors are scrubbed: NetError for transport failures and 5xx, APIError for
+// a refusal in the response.
+func (c *Client) post(ctx context.Context, method string, body io.Reader, contentType string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.methodURL(method), body)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", contentType)
 	httpc := c.HTTP
 	if httpc == nil {
 		httpc = http.DefaultClient
@@ -136,9 +147,50 @@ func (c *Client) SendMessage(ctx context.Context, r SendRequest) (int64, error) 
 	return msg.MessageID, nil
 }
 
-// SetMessageReaction puts one emoji reaction on a message.
+// SendVoice uploads r.Audio (an OGG/Opus file) as a voice message and returns
+// the new message id. Duration, caption and the silent flag are sent only when
+// set. The upload is bounded by ctx and the client's timeout.
+func (c *Client) SendVoice(ctx context.Context, r VoiceRequest) (int64, error) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("chat_id", strconv.FormatInt(r.ChatID, 10))
+	if r.Duration > 0 {
+		_ = mw.WriteField("duration", strconv.Itoa(r.Duration))
+	}
+	if r.Caption != "" {
+		_ = mw.WriteField("caption", r.Caption)
+	}
+	if r.Silent {
+		_ = mw.WriteField("disable_notification", "true")
+	}
+	h := textproto.MIMEHeader{}
+	h.Set("Content-Disposition", `form-data; name="voice"; filename="voice.ogg"`)
+	h.Set("Content-Type", "audio/ogg")
+	part, err := mw.CreatePart(h)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := part.Write(r.Audio); err != nil {
+		return 0, err
+	}
+	if err := mw.Close(); err != nil {
+		return 0, err
+	}
+	var msg Message
+	if err := c.post(ctx, "sendVoice", &buf, mw.FormDataContentType(), &msg); err != nil {
+		return 0, err
+	}
+	return msg.MessageID, nil
+}
+
+// SetMessageReaction puts one emoji reaction on a message; an empty emoji
+// clears the bot's reaction.
 func (c *Client) SetMessageReaction(ctx context.Context, chatID, messageID int64, emoji string) error {
-	params := map[string]any{"chat_id": chatID, "message_id": messageID, "reaction": []map[string]string{{"type": "emoji", "emoji": emoji}}}
+	reaction := []map[string]string{}
+	if emoji != "" {
+		reaction = append(reaction, map[string]string{"type": "emoji", "emoji": emoji})
+	}
+	params := map[string]any{"chat_id": chatID, "message_id": messageID, "reaction": reaction}
 	return c.call(ctx, "setMessageReaction", params, nil)
 }
 
@@ -177,6 +229,56 @@ func (c *Client) EditMessage(ctx context.Context, chatID, messageID int64, text,
 func (c *Client) EditReplyMarkup(ctx context.Context, chatID, messageID int64, kb [][]Button) error {
 	params := map[string]any{"chat_id": chatID, "message_id": messageID, "reply_markup": replyMarkup(kb)}
 	return c.call(ctx, "editMessageReplyMarkup", params, nil)
+}
+
+// GetFile resolves a file id to the path Download fetches it from.
+func (c *Client) GetFile(ctx context.Context, fileID string) (File, error) {
+	var f File
+	err := c.call(ctx, "getFile", map[string]any{"file_id": fileID}, &f)
+	return f, err
+}
+
+// Download fetches a file returned by GetFile (bots may download up to 20 MB)
+// and fails with "file too big" when it exceeds max bytes. It is bounded by
+// ctx rather than the client's short timeout, which suits slow transfers.
+// A non-200 status and "file too big" are plain (permanent) errors; transport
+// failures are *NetError.
+func (c *Client) Download(ctx context.Context, filePath string, max int64) ([]byte, error) {
+	base := c.BaseURL
+	if base == "" {
+		base = DefaultBaseURL
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/file/bot"+c.Token+"/"+filePath, nil)
+	if err != nil {
+		return nil, c.scrub(wrapTransport(err))
+	}
+	httpc := &http.Client{}
+	if c.HTTP != nil {
+		httpc = &http.Client{Transport: c.HTTP.Transport}
+	}
+	resp, err := httpc.Do(req)
+	if err != nil {
+		return nil, c.scrub(wrapTransport(err))
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, c.scrub(fmt.Errorf("http %d", resp.StatusCode))
+	}
+	if max < 0 {
+		max = 0
+	}
+	limit := max
+	if limit < math.MaxInt64 {
+		limit++ // one extra byte tells "exactly max" from "over max"
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit))
+	if err != nil {
+		return nil, c.scrub(wrapTransport(err))
+	}
+	if int64(len(data)) > max {
+		return nil, errors.New("file too big")
+	}
+	return data, nil
 }
 
 // SetMyCommands fills the bot's "/" menu.

@@ -2,6 +2,8 @@ package hooks
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"github.com/IZZY-Agency/claude-tg/internal/send/sendtest"
 	"github.com/IZZY-Agency/claude-tg/internal/session"
 	"github.com/IZZY-Agency/claude-tg/internal/state"
+	"github.com/IZZY-Agency/claude-tg/internal/term"
 )
 
 const sid = "6449d606-55c1-4e6d-a915-4b14c777f57f"
@@ -168,6 +171,51 @@ func TestAlertsRespectAwayGate(t *testing.T) {
 	}
 }
 
+// phone fixes whether the turn counts as started from the phone.
+func (h *harness) phone(fromPhone bool) {
+	h.deps.FromPhone = func(*Input, *state.Session) bool { return fromPhone }
+}
+
+func TestAlertPhoneStartedAtKeyboard(t *testing.T) {
+	h := newHarness(t)
+	h.away = false
+	var logs []string
+	h.deps.Log = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+	h.phone(false)
+	_ = Handle(context.Background(), "notification", load(t, "notification_permission.json"), h.deps)
+	if len(h.rec.Calls) != 0 || len(logs) != 1 || !strings.HasPrefix(logs[0], "alert suppressed (user at keyboard)") {
+		t.Fatalf("calls=%d logs=%q", len(h.rec.Calls), logs)
+	}
+	h.phone(true)
+	_ = Handle(context.Background(), "notification", load(t, "notification_permission.json"), h.deps)
+	if len(h.rec.Calls) != 1 {
+		t.Fatalf("phone-started alert not sent: calls=%d", len(h.rec.Calls))
+	}
+}
+
+func TestStopFailurePhoneStartedAtKeyboard(t *testing.T) {
+	h := newHarness(t)
+	h.away = false
+	h.phone(true)
+	_ = Handle(context.Background(), "stop-failure", load(t, "stop_failure.json"), h.deps)
+	if len(h.rec.Calls) != 1 {
+		t.Fatalf("calls=%d", len(h.rec.Calls))
+	}
+}
+
+func TestAlertPhoneStartedDedupe(t *testing.T) {
+	h := newHarness(t)
+	h.away = false
+	h.phone(true)
+	in := load(t, "notification_permission.json")
+	_ = Handle(context.Background(), "notification", in, h.deps)
+	h.now = h.now.Add(5 * time.Minute)
+	_ = Handle(context.Background(), "notification", in, h.deps)
+	if len(h.rec.Calls) != 1 {
+		t.Fatalf("duplicate alert sent: calls=%d", len(h.rec.Calls))
+	}
+}
+
 func TestAlertsDedupe(t *testing.T) {
 	h := newHarness(t)
 	in := load(t, "notification_permission.json")
@@ -192,14 +240,23 @@ func TestStopFailureText(t *testing.T) {
 	}
 }
 
+// A session end turns follow off and forgets the session's voice marks in
+// the same write: a session id resumed within the hour must not speak a
+// later answer for a note the ended session never answered.
 func TestSessionEndClearsFollow(t *testing.T) {
 	h := newHarness(t)
 	h.follow(t)
+	if _, err := h.store.UpdateSession(sid, func(s *state.Session) {
+		s.MarkVoice("", "", h.now)
+		s.MarkVoice("0123456789abcdef", "", h.now)
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := Handle(context.Background(), "session-end", load(t, "session_end.json"), h.deps); err != nil {
 		t.Fatal(err)
 	}
 	s, _ := h.store.LoadSession(sid)
-	if s.Follow || s.EndedAt.IsZero() || len(h.rec.Calls) != 0 {
+	if s.Follow || s.EndedAt.IsZero() || len(s.VoiceMarks) != 0 || len(h.rec.Calls) != 0 {
 		t.Fatalf("session=%+v calls=%d", s, len(h.rec.Calls))
 	}
 }
@@ -286,7 +343,9 @@ func TestNotificationSkippedWhileAskOpen(t *testing.T) {
 	if err := Handle(context.Background(), "permission-request", load(t, "permission_request_bash.json"), h.deps); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.store.PutAsk(&state.Ask{ID: state.NewAskID(), SessionID: sid, Tool: "Bash", HookPID: 4242, Created: h.now}); err != nil {
+	pane := termScreen(t, "permission-screen.txt")
+	h.deps.Screen = func(context.Context) (string, error) { return pane, nil }
+	if err := h.store.PutAsk(&state.Ask{ID: state.NewAskID(), SessionID: sid, Tool: "Bash", HookPID: 4242, Created: h.now, Signature: state.Fingerprint(term.PermissionSignature(pane))}); err != nil {
 		t.Fatal(err)
 	}
 	h.deps.Alive = func(pid int) bool { return true }
@@ -295,6 +354,80 @@ func TestNotificationSkippedWhileAskOpen(t *testing.T) {
 	}
 	if len(h.rec.Calls) != 0 {
 		t.Fatalf("alert sent while a waiting hook handles the dialog: %+v", h.rec.Calls)
+	}
+}
+
+// The alert is skipped only for the dialog on the pane: a hook's claim on a
+// dialog since answered at the Mac, which it has not yet seen close, owns
+// nothing there. Without a pane read nothing is known to be
+// claimed, and the alert goes.
+func TestNotificationChecksTheDialogOnThePane(t *testing.T) {
+	pane := termScreen(t, "permission-screen.txt")
+	for name, c := range map[string]struct {
+		claimed string // the dialog whose signature the live ask claimed
+		screen  func() (string, error)
+		want    int
+	}{
+		"the dialog on the pane":         {pane, func() (string, error) { return pane, nil }, 0},
+		"a dialog since answered":        {termScreen(t, "mcp-dialog.txt"), func() (string, error) { return pane, nil }, 1},
+		"a pane that cannot be read":     {pane, func() (string, error) { return "", errors.New("no pane") }, 1},
+		"no pane reader":                 {pane, nil, 1},
+		"no dialog on the pane any more": {pane, func() (string, error) { return termScreen(t, "idle-screen.txt"), nil }, 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			h.deps.Alive = func(pid int) bool { return true }
+			if c.screen != nil {
+				h.deps.Screen = func(context.Context) (string, error) { return c.screen() }
+			}
+			if err := Handle(context.Background(), "permission-request", load(t, "permission_request_bash.json"), h.deps); err != nil {
+				t.Fatal(err)
+			}
+			_ = h.store.PutAsk(&state.Ask{ID: state.NewAskID(), SessionID: sid, Tool: "Bash", HookPID: 4242, Created: h.now,
+				Signature: state.Fingerprint(term.PermissionSignature(c.claimed))})
+			if err := Handle(context.Background(), "notification", load(t, "notification_permission.json"), h.deps); err != nil {
+				t.Fatal(err)
+			}
+			if len(h.rec.Calls) != c.want {
+				t.Fatalf("calls=%+v, want %d", h.rec.Calls, c.want)
+			}
+		})
+	}
+}
+
+// Calls made at once share one dialog (ruling P25): the hook of the call
+// queued behind the one shown waits with its ask open and nothing claimed.
+// The hook that claimed the dialog shown silences the alert; with none (a
+// first call tg cannot tie to its dialog), the alert goes.
+func TestNotificationWhileACallIsQueued(t *testing.T) {
+	for name, c := range map[string]struct {
+		claimed bool
+		want    int
+	}{
+		"the call shown claimed by its hook": {true, 0},
+		"the call shown claimed by none":     {false, 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			h.deps.Alive = func(pid int) bool { return true }
+			pane := termScreen(t, "mcp-queue-1of2.txt")
+			h.deps.Screen = func(context.Context) (string, error) { return pane, nil }
+			h.now = h.now.Add(-time.Second)
+			if c.claimed {
+				_ = h.store.PutAsk(&state.Ask{ID: state.NewAskID(), SessionID: sid, Tool: "Bash", HookPID: 4241, Created: h.now, Signature: state.Fingerprint(term.PermissionSignature(pane))})
+			}
+			if err := Handle(context.Background(), "permission-request", load(t, "permission_request_bash.json"), h.deps); err != nil {
+				t.Fatal(err)
+			}
+			h.now = h.now.Add(time.Second)
+			_ = h.store.PutAsk(&state.Ask{ID: state.NewAskID(), SessionID: sid, Tool: "Bash", HookPID: 4242, Created: h.now})
+			if err := Handle(context.Background(), "notification", load(t, "notification_permission.json"), h.deps); err != nil {
+				t.Fatal(err)
+			}
+			if len(h.rec.Calls) != c.want {
+				t.Fatalf("calls=%+v, want %d", h.rec.Calls, c.want)
+			}
+		})
 	}
 }
 
@@ -328,5 +461,60 @@ func TestNotificationStillSentWithoutAsk(t *testing.T) {
 				t.Fatalf("calls=%+v", h.rec.Calls)
 			}
 		})
+	}
+}
+
+// testKey stands in for a configured TypeSafe key: no credential pattern
+// of render.Redact matches it, so only the sender's secrets scrub it.
+const testKey = "tsk_live_9QzXv7LmPq2Rw8Yb"
+
+// The hooks' own log lines that carry an alert's text scrub the configured
+// secrets as a message is (send.Sender.Clean): the TypeSafe key in an
+// alert logs [redacted], whether the alert is held at the keyboard or
+// deduped.
+func TestAlertLogScrubsSecrets(t *testing.T) {
+	h := newHarness(t)
+	h.deps.Sender.Secrets = []string{"123456:ABCDEFsecretbot", testKey}
+	var logs []string
+	h.deps.Log = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+	in := load(t, "notification_agent.json")
+	in.Message = "Background agent url-revert found the key " + testKey
+	h.away = false
+	h.phone(false)
+	_ = Handle(context.Background(), "notification", in, h.deps)
+	h.away = true
+	_ = Handle(context.Background(), "notification", in, h.deps)
+	_ = Handle(context.Background(), "notification", in, h.deps)
+	const text = "needs input: Background agent url-revert found the key [redacted]"
+	want := []string{"alert suppressed (user at keyboard): " + text, "alert deduped: " + text}
+	if len(logs) != 2 || logs[0] != want[0] || logs[1] != want[1] {
+		t.Fatalf("logs=%q, want %q", logs, want)
+	}
+	if len(h.rec.Calls) != 1 || strings.Contains(h.rec.Calls[0].Text, testKey) {
+		t.Fatalf("calls=%+v", h.rec.Calls)
+	}
+}
+
+// The summary is cleaned before it is cut at summaryMax runes: a
+// configured secret crossing the cut leaves no prefix of itself in the
+// session record or the 🔐 alert.
+func TestPermissionSummaryCleanedBeforeCut(t *testing.T) {
+	h := newHarness(t)
+	h.deps.Sender.Secrets = []string{testKey}
+	in := load(t, "permission_request_bash.json")
+	// The key starts at rune 116 of the command: its first four runes fall
+	// before the cut.
+	in.ToolInput = []byte(`{"command":"echo ` + strings.Repeat("a", summaryMax-10) + ` ` + testKey + ` done"}`)
+	if err := Handle(context.Background(), "permission-request", in, h.deps); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := h.store.LoadSession(sid)
+	if want := "echo " + strings.Repeat("a", summaryMax-10) + " [red…"; s.PendingPermission == nil || s.PendingPermission.Summary != want {
+		t.Fatalf("pending=%+v, want the summary %q", s.PendingPermission, want)
+	}
+	h.now = h.now.Add(6 * time.Second)
+	_ = Handle(context.Background(), "notification", load(t, "notification_permission.json"), h.deps)
+	if len(h.rec.Calls) != 1 || strings.Contains(h.rec.Calls[0].Text, testKey[:4]) {
+		t.Fatalf("calls=%+v", h.rec.Calls)
 	}
 }

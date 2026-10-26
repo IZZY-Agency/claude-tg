@@ -1,15 +1,22 @@
 package hooks
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/IZZY-Agency/claude-tg/internal/ask"
 	"github.com/IZZY-Agency/claude-tg/internal/render"
@@ -55,6 +62,18 @@ const (
 	// ask's lock (ruling R44): Claude Code has the answer by then, and the
 	// relay or its sweep finishes the ask.
 	commitLockWait = time.Second
+
+	// A turn not found phone-started is checked again every phoneRecheck
+	// during the first phoneRecheckFor of the wait (ruling P14): the relay
+	// records its line only once its Enter returns, which may be after
+	// Claude Code took the prompt and the hook first looked.
+	phoneRecheck    = 5 * time.Second
+	phoneRecheckFor = 30 * time.Second
+
+	// fallbackWindow is how long after the relay typed the phone's /approve
+	// or /deny fallback into the session (state.Session.PhoneAnswerAt) a
+	// dialog seen closed counts as closed from the phone (ruling P20).
+	fallbackWindow = 30 * time.Second
 )
 
 // Why a wait ended without a phone answer: the Closed value and the line
@@ -205,7 +224,10 @@ func WaitPermission(ctx context.Context, in *Input, d Deps) (out []byte, commit 
 	case w.poll():
 		return nil, nil
 	}
-	w.summary = Summary(in.ToolName, in.ToolInput)
+	// Cleaned before it is cut and stored (Deps.summary): the ask and its
+	// messages never hold a configured secret, or any prefix of one, or a
+	// credential the call's input carries.
+	w.summary = d.summary(in.ToolName, in.ToolInput)
 	if in.ToolName == questionTool {
 		qs, err := ask.ParseQuestions(in.ToolInput)
 		if err != nil {
@@ -224,6 +246,7 @@ func WaitPermission(ctx context.Context, in *Input, d Deps) (out []byte, commit 
 		HookPID:     os.Getpid(),
 		Created:     now,
 		Deadline:    now.Add(d.deadline()),
+		Keys:        askKeys(w.keys, w.in.ToolInput, w.clean),
 	}
 	if w.qs != nil {
 		// Only a question needs its input back; a Write or Edit input can
@@ -264,7 +287,9 @@ type waiter struct {
 	closeBy time.Time // the one deadline for closing (budget): lock waits and closing edits
 	// A failure that repeats every tick or away check is logged once, until
 	// the call works again.
-	pollFailed, sendFailed, loadFailed, screenFailed, claimFailed bool
+	pollFailed, sendFailed, loadFailed, screenFailed, claimFailed, listFailed bool
+
+	phoneLogged bool // why the turn is not phone-started was logged (fromPhone)
 }
 
 func (w *waiter) logf(format string, args ...any) {
@@ -391,27 +416,116 @@ func (w *waiter) look(ctx context.Context) sight {
 // queued before it) and is never adopted (ruling R30), nor is one another
 // ask of the session claimed, or may still claim, first (R30b): keys of
 // concurrent calls can be alike.
+//
+// Calls made at once wait on one dialog, the first not yet answered shown
+// with a queue counter (term.DialogQueued): a call's own dialog comes up
+// only once the ones before it are answered. While the pane shows calls
+// queued, the hook keeps looking, every tick, until dialogWait after the
+// last read that showed them; it stops when the call has a result (the
+// queue answered at the Mac), the session ends or the ask's deadline
+// passes. A dialog that shows this call's keys and every key of another
+// call still looking, keys that are more than this call's, is that call's
+// (yields).
 func (w *waiter) seeDialog(ctx context.Context) bool {
 	d := w.d
 	if d.Screen == nil {
 		w.logf("no buttons: no terminal pane to read")
 		return false
 	}
-	until := d.now().Add(dialogWait)
+	until, every := d.now().Add(dialogWait), dialogPoll
+	queued := false
 	for {
 		screen, err := d.Screen(ctx)
 		w.logOnce(&w.screenFailed, "screen", err)
 		if err == nil {
-			if sig, shows, whole := w.dialog(screen); sig != "" && w.keys.shownIn(shows, whole) && w.claim(sig) {
+			if sig, shows, whole := w.dialog(screen); sig != "" && w.keys.shownIn(shows, whole) && !w.yields(shows) && w.claim(sig) {
 				w.sig = sig
 				return true
 			}
+			if w.qs == nil && term.DialogQueued(screen) {
+				queued, until = true, d.now().Add(dialogWait)
+			}
 		}
-		if !d.now().Before(until) || !d.sleep(ctx, dialogPoll) {
-			w.logf("no buttons: no dialog of this call on the pane within %s", dialogWait)
+		switch {
+		case queued && w.poll():
+			w.logf("no buttons: answered at the Mac while queued behind another call")
+			return false
+		case queued && w.ended():
+			w.logf("no buttons: the session ended while queued behind another call")
+			return false
+		case !d.now().Before(w.until):
+			w.logf("no buttons: queued behind other calls until the deadline")
+			return false
+		}
+		if !d.now().Before(until) {
+			if queued {
+				w.logf("no buttons: the queued calls went without this call's dialog")
+			} else {
+				w.logf("no buttons: no dialog of this call on the pane within %s", dialogWait)
+			}
+			return false
+		}
+		if queued {
+			every = d.tick()
+		}
+		if !d.sleep(ctx, every) {
+			w.logf("no buttons: no dialog of this call on the pane")
 			return false
 		}
 	}
+}
+
+// yields reports whether a dialog showing this call's keys (shows, read
+// whole) belongs to another call of the session whose hook still looks for
+// its dialog: one whose keys are this call's and more, every one shown
+// (ruling P27). The current weather's keys are all in the forecast's
+// dialog, which shows a day count too. Only MCP calls have such keys
+// (state.Ask.Keys); equal keys stay with the claim's order.
+//
+// The keys compare as their asks store them (askKeys), as sets. A call
+// whose input holds a secret stores none: it neither takes a dialog from
+// another this way nor gives one up.
+func (w *waiter) yields(shows string) bool {
+	ours := askKeys(w.keys, w.in.ToolInput, w.clean)
+	if len(ours) == 0 {
+		return false
+	}
+	asks, err := w.d.Store.ListAsks()
+	w.logOnce(&w.listFailed, "list asks", err)
+	for _, a := range asks {
+		if a.ID == w.id || a.SessionID != w.in.SessionID || !a.Open() || a.Signature != "" || !w.d.alive(a.HookPID) {
+			continue
+		}
+		theirs := a.Keys
+		if len(theirs) > len(ours) && !slices.ContainsFunc(ours, func(k string) bool { return !slices.Contains(theirs, k) }) &&
+			!slices.ContainsFunc(theirs, func(k string) bool { return !hasArg(shows, k) }) {
+			return true
+		}
+	}
+	return false
+}
+
+// askKeys is an MCP call's keys as its ask stores them (state.Ask.Keys),
+// each once. A call whose input cleaning changes (the bot token, a
+// credential) stores none: its keys shorten long values to keyLen runes,
+// and a shortened secret no longer matches what cleaning masks.
+// nil for any other call.
+func askKeys(k callKeys, input json.RawMessage, clean func(string) string) []string {
+	if clean(string(input)) != string(input) {
+		return nil
+	}
+	return unique(k.every)
+}
+
+// unique is keys without repeats, in the order each first comes.
+func unique(keys []string) []string {
+	var out []string
+	for _, k := range keys {
+		if !slices.Contains(out, k) {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // claim records sig on the ask unless the dialog belongs to another ask
@@ -427,6 +541,16 @@ func (w *waiter) run(ctx context.Context) []byte {
 	d := w.d
 	var nextAway, nextScreen time.Time
 	suspect := false // the last read missed the dialog: the next one, a tick later, decides
+	// A turn started from the phone has its owner away from the Mac, so
+	// the buttons go out without waiting for the idle time. Judged once
+	// the dialog is seen, on the session record loaded then, and while it
+	// is not phone-started and messages are still to send, again every
+	// phoneRecheck until phoneRecheckFor has passed; a turn found
+	// phone-started then ends the idle wait at once. The screen guard, an
+	// answer at the Mac and the deadline stay as they are.
+	start := d.now()
+	phone := w.fromPhone()
+	nextPhone, phoneUntil := start.Add(phoneRecheck), start.Add(phoneRecheckFor)
 	for {
 		if ctx.Err() != nil {
 			return w.cancelled()
@@ -465,8 +589,17 @@ func (w *waiter) run(ctx context.Context) []byte {
 				}
 			}
 		}
+		if !phone && len(w.sent) < w.n && now.Before(phoneUntil) && !now.Before(nextPhone) {
+			nextPhone = now.Add(phoneRecheck)
+			if phone = w.fromPhone(); phone {
+				nextAway = now // the idle wait is over: send now
+			}
+		}
 		if !suspect && len(w.sent) < w.n && !now.Before(nextAway) {
-			wait := d.awayIn(ctx)
+			var wait time.Duration
+			if !phone {
+				wait = d.awayIn(ctx)
+			}
 			if wait > 0 {
 				// The idle time grows a second a second: the gate cannot
 				// open sooner. At least a second, so no busy re-check.
@@ -505,6 +638,25 @@ func (w *waiter) run(ctx context.Context) []byte {
 			return w.cancelled()
 		}
 	}
+}
+
+// fromPhone loads the session afresh and reports whether the turn started
+// from the phone (phoneStarted), logging the line that says so, or, once
+// per hook call, why a session holding phone lines does not count.
+func (w *waiter) fromPhone() bool {
+	sess, err := w.d.Store.LoadSession(w.in.SessionID)
+	if err != nil {
+		return false
+	}
+	phone, why := w.d.phoneStarted(w.in, sess)
+	if why != "" && !w.phoneLogged {
+		w.phoneLogged = true
+		w.d.logPhone(w.in.SessionID, why)
+	}
+	if phone {
+		w.logf("phone-started turn: sending now")
+	}
+	return phone
 }
 
 // cancelled closes a wait whose context ended: SIGTERM, SIGHUP or SIGINT.
@@ -628,12 +780,7 @@ func (w *waiter) plainAlert(ctx context.Context) {
 
 // clean is what the sender applies to every plain text and button text it
 // sends (secrets scrubbed, credentials redacted), so stored texts match it.
-func (w *waiter) clean(text string) string {
-	if w.d.Sender == nil {
-		return render.Redact(text)
-	}
-	return w.d.Sender.Clean(text)
-}
+func (w *waiter) clean(text string) string { return w.d.clean(text) }
 
 // cleanHTML is clean for HTML: credentials are redacted between the tags
 // only, so a masked value never swallows a closing tag. Every HTML text the
@@ -704,8 +851,9 @@ func (w *waiter) budget() time.Time {
 // end finishes a wait that closed for reason without the phone's answer
 // reaching Claude Code. a is the ask as closed (closeAsk), or nil to close
 // it here. The closure is on record first, the answer the relay counted as
-// owed to the phone (Armed) marked owed back (TakeBack); then that answer
-// is taken back within the lock budget (giveBack, the session's lock), the
+// owed to the phone (Armed) marked owed back (TakeBack); a dialog answered
+// at the Mac is recorded in the session (macAnswered); then that answer is
+// taken back within the lock budget (giveBack, the session's lock), the
 // messages are edited and the ask removed. An answer not taken back in
 // time leaves the ask to the relay's sweep, which finishes it.
 func (w *waiter) end(reason string, a *state.Ask) []byte {
@@ -718,6 +866,9 @@ func (w *waiter) end(reason string, a *state.Ask) []byte {
 		}
 	}
 	w.logf("closed: %s", reason)
+	if reason == closedMac {
+		w.macAnswered(until)
+	}
 	owed := a != nil && a.TakeBack && !w.giveBack(until)
 	edited := w.editAll(a, reason)
 	switch {
@@ -741,10 +892,41 @@ func closeAsk(a *state.Ask, reason string) error {
 	return nil
 }
 
-// giveBack takes back, by until, the credit the relay gave the phone's
-// answer in the session's AskCredits (state.Store.TakeBackAnswer: only
-// this ask's, and nothing once the Stop hook spent it), and reports
-// whether it did.
+// macAnswered records in the session, by until, that one of its prompts
+// was just answered at the Mac (state.Session.MacAnswerAt): the owner is
+// there, so a turn the phone started before now no longer counts as one
+// (phoneCheck, ruling P16). A later time already there is kept. A dialog
+// closed within fallbackWindow after the relay typed the phone's /approve
+// or /deny into it (state.Session.PhoneAnswerAt) was answered from the
+// phone, and nothing is recorded (P20). A failure is only logged: the
+// turn's prompts may then still skip the idle time.
+func (w *waiter) macAnswered(until time.Time) {
+	ctx, cancel := context.WithDeadline(context.Background(), until)
+	defer cancel()
+	now := w.d.now()
+	phone := false
+	if _, err := w.d.Store.UpdateSessionCtx(ctx, w.in.SessionID, func(s *state.Session) {
+		if d := now.Sub(s.PhoneAnswerAt); d >= 0 && d <= fallbackWindow {
+			phone = true
+			return
+		}
+		if now.After(s.MacAnswerAt) {
+			s.MacAnswerAt = now
+		}
+	}); err != nil {
+		w.logf("record the answer at the Mac: %v", err)
+	}
+	if phone {
+		w.logf("closed by the phone's /approve or /deny: no answer at the Mac recorded")
+	}
+}
+
+// giveBack takes back, by until, what the relay gave the phone's answer in
+// the session (state.Store.TakeBackAnswer, only this ask's): its credit in
+// AskCredits, unless the Stop hook already spent it, and its voice mark
+// whenever that is still there. Credits and marks are spent in separate
+// oldest-first orders, so either may be gone while the other is left. It
+// reports false when the session could not be updated by until.
 func (w *waiter) giveBack(until time.Time) bool {
 	ctx, cancel := context.WithDeadline(context.Background(), until)
 	defer cancel()
@@ -877,19 +1059,24 @@ const keyLen = 40
 
 // callKeys are texts of a call that its dialog shows, in its words (rulings
 // R30, R30b). A dialog whose top border is in the read must show one of
-// whole; one taller than the read shows only its question, which must show
-// one of tall (none: such a dialog is never adopted). A key is compared
-// with whitespace and line breaks removed (term.SignatureHas); "─" stands
-// for one of the dialog's rules.
-type callKeys struct{ whole, tall []string }
+// whole, or every one of every (each standing alone: hasArg); one taller
+// than the read shows only its question, which must show one of tall
+// (none: such a dialog is never adopted). A key is compared with
+// whitespace and line breaks removed (term.SignatureHas); "─" stands for
+// one of the dialog's rules.
+type callKeys struct{ whole, tall, every []string }
 
-func (k callKeys) empty() bool { return len(k.whole) == 0 }
+func (k callKeys) empty() bool { return len(k.whole) == 0 && len(k.every) == 0 }
 
-// shownIn reports whether a dialog's signature shows one of the keys.
+// shownIn reports whether a dialog's signature shows the keys: one of
+// whole, or every one of every (a whole dialog); one of tall (a taller one).
 func (k callKeys) shownIn(sig string, whole bool) bool {
 	keys := k.tall
 	if whole {
 		keys = k.whole
+		if len(k.every) > 0 && !slices.ContainsFunc(k.every, func(key string) bool { return !hasArg(sig, key) }) {
+			return true
+		}
 	}
 	for _, key := range keys {
 		if term.SignatureHas(sig, key) {
@@ -916,9 +1103,28 @@ func (k callKeys) shownIn(sig string, whole bool) bool {
 //   - AskUserQuestion: the first question's first keyLen characters.
 //   - Read inside the cwd, NotebookEdit, MultiEdit: the base name, without
 //     a recorded dialog to delimit it.
+//   - An MCP tool (mcp__ server and tool): "(MCP)" and one key for every
+//     leaf of the input, nested objects and arrays included, as the
+//     dialog prints the arguments (queryParams: { query: "Paris, France"
+//     }); all of them must show, each standing alone (hasArg). A leaf
+//     under an object key that is a plain identifier is that name, a
+//     colon and the value (query:"Paris, France"), so a value under
+//     another name, or another tool's argument, does not match; an array
+//     item or a value under any other name is the value alone. The value
+//     is a string in quotes, so a short one never matches a longer one it
+//     starts, or, from keyLen runes on, an opening quote and the first
+//     keyLen runes; a whole number, true or false as written. A string
+//     with a quote, a backslash or a line break (the dialog escapes or
+//     wraps it), a blank one, a float and a null give no key, and an
+//     input without a usable string has no keys: numbers and booleans
+//     only add precision (rulings P5, P12, P21). Never adopted from a
+//     dialog taller than the read.
 //
 // No keys for any other tool or input: no dialog can be tied to the call.
 func callKey(tool string, input json.RawMessage, cwd string) callKeys {
+	if strings.HasPrefix(tool, "mcp__") {
+		return mcpKeys(input)
+	}
 	var in struct {
 		Command      string          `json:"command"`
 		FilePath     string          `json:"file_path"`
@@ -1003,6 +1209,139 @@ func callKey(tool string, input json.RawMessage, cwd string) callKeys {
 		}
 	}
 	return callKeys{}
+}
+
+// argName is an object key the dialog prints bare, as a plain identifier.
+var argName = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
+
+// mcpKeys is the keys of an MCP call (callKey): "(MCP)", which the
+// dialog's title ends with, and a key for each usable leaf of the input,
+// in the order of a walk with object keys sorted. Numbers and booleans
+// add precision but never tie a call to a dialog alone (ruling P21): an
+// input without a usable string has no keys, as one with no usable leaf.
+// Numbers are kept as written (json.Number), so a whole number is told
+// from a float by its text.
+func mcpKeys(input json.RawMessage) callKeys {
+	if !json.Valid(input) {
+		return callKeys{}
+	}
+	dec := json.NewDecoder(bytes.NewReader(input))
+	dec.UseNumber()
+	var v any
+	if dec.Decode(&v) != nil {
+		return callKeys{}
+	}
+	var keys []string
+	text := false // a string among the keys
+	var walk func(name string, v any)
+	walk = func(name string, v any) {
+		switch x := v.(type) {
+		case []any:
+			for _, e := range x {
+				walk("", e)
+			}
+		case map[string]any:
+			for _, k := range slices.Sorted(maps.Keys(x)) {
+				n := ""
+				if argName.MatchString(k) {
+					n = k
+				}
+				walk(n, x[k])
+			}
+		default:
+			if val, ok := mcpValue(x); ok {
+				_, isString := x.(string)
+				text = text || isString
+				if name != "" {
+					val = name + ":" + val
+				}
+				if !slices.Contains(keys, val) { // a repeat proves nothing more
+					keys = append(keys, val)
+				}
+			}
+		}
+	}
+	walk("", v)
+	if !text {
+		return callKeys{}
+	}
+	return callKeys{every: append([]string{"(MCP)"}, keys...)}
+}
+
+// mcpValue is a leaf of an MCP call's input as the dialog prints it, and
+// whether it gives a key at all. A string shorter than keyLen runes is in
+// full with both quotes, so "Lyon" never finds a dialog that shows "Lyon,
+// France"; a longer one is its opening quote and first keyLen runes (how
+// Claude Code shortens it is unproven). A whole number (no ".", "e" or
+// "E") and true or false are their JSON text. A string with a quote, a
+// backslash or a line break, a blank one, a float and a null give none.
+func mcpValue(v any) (string, bool) {
+	switch x := v.(type) {
+	case string:
+		switch {
+		case strings.TrimSpace(x) == "" || strings.ContainsAny(x, "\"\\\n\r"):
+			return "", false
+		case len([]rune(x)) < keyLen:
+			return `"` + x + `"`, true
+		}
+		return `"` + clip(x, keyLen), true
+	case json.Number:
+		if strings.ContainsAny(x.String(), ".eE") {
+			return "", false
+		}
+		return x.String(), true
+	case bool:
+		return strconv.FormatBool(x), true
+	}
+	return "", false
+}
+
+// hasArg reports whether a dialog's signature shows key, an MCP call's key
+// (mcpKeys), compared without whitespace like every key, and standing
+// alone: a key that starts with a word character (a letter, a digit, "_",
+// "$", ".", "+" or "-") does not follow one there, and one that ends with
+// one, unless it holds a string, does not precede one. So "limit:5" is not
+// found in "limit:50" or "limit:5.5", "5" not in "15" or "-5", and
+// `query:"x"` not in `subquery:"x"`. A string's key ends at its closing
+// quote, and a long string's is its start by design: what follows it is
+// not looked at.
+func hasArg(sig, key string) bool {
+	k := strings.Join(strings.Fields(key), "")
+	if k == "" {
+		return false
+	}
+	first, _ := utf8.DecodeRuneInString(k)
+	last, _ := utf8.DecodeLastRuneInString(k)
+	checkBefore := wordRune(first)
+	checkAfter := wordRune(last) && !strings.Contains(k, `"`)
+	for i := 0; i < len(sig); {
+		j := strings.Index(sig[i:], k)
+		if j < 0 {
+			return false
+		}
+		j += i
+		before, _ := utf8.DecodeLastRuneInString(sig[:j])
+		after, _ := utf8.DecodeRuneInString(sig[j+len(k):])
+		if (!checkBefore || j == 0 || !wordRune(before)) && (!checkAfter || j+len(k) == len(sig) || !wordRune(after)) {
+			return true
+		}
+		i = j + 1
+	}
+	return false
+}
+
+// wordRune reports whether r can be part of a name or a number as a dialog
+// prints it.
+func wordRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || strings.ContainsRune("_$.+-", r)
+}
+
+// clip is s clipped to n runes.
+func clip(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		return string(r[:n])
+	}
+	return s
 }
 
 // relTo is path relative to cwd, and whether path lies inside cwd. Without

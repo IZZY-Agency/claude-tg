@@ -1,0 +1,85 @@
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Opus 5.5 with xhigh effort · Claude Max
+ ▝▝   ▝▝   /Users/alex/proj
+
+⚠ Your login expires in 2 days · run /login to renew
+
+❯ Reply with the single word: ready                                                                                                            
+
+⏺ ready
+
+✻ Sautéed for 3s · done 8:49 AM
+
+❯  What is the weather in Paris today?                                                                                                         
+
+  Calling AccuWeather® 4 times · 3m 8s…
+  ⎿  Allowed by PermissionRequest hook
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Tool use                                                                                                                               2 of 2
+ AccuWeather® — Today & Tonight Forecast Tool: (MCP)
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ queryParams: { locationKey: "2608456", unit: "metric", lang: "en", days: 1 }
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ About the AccuWeather® — Today & Tonight Forecast Tool:
+ │ Get the daily forecast (up to 10 days) for a specified location key, including highs/lows, precipitation chances, and alerts.
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for AccuWeather® — Today & Tonight Forecast commands in /Users/alex/proj
+   3. No
+
+ Esc to cancel · Tab to amend
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
+  
+  

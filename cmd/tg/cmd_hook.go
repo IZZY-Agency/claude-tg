@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/IZZY-Agency/claude-tg/internal/agterm"
+	"github.com/IZZY-Agency/claude-tg/internal/classify"
 	"github.com/IZZY-Agency/claude-tg/internal/config"
 	"github.com/IZZY-Agency/claude-tg/internal/hooks"
 	"github.com/IZZY-Agency/claude-tg/internal/idle"
@@ -28,6 +29,16 @@ func init() {
 
 const (
 	hookTimeout = 15 * time.Second
+	// stopSpeechTimeout is the stop hook's budget when speech_command is
+	// set: the 30 seconds TypeSafe's judgment (with a key), the speech
+	// command and the voice upload share (hooks.Deps.SpeechWindow), the
+	// text's reserve, and room for the spool flush before them. The stop
+	// hook is async, so Claude Code never waits on it.
+	stopSpeechTimeout = 60 * time.Second
+	// stopTextReserve is the part of stopSpeechTimeout that speech and the
+	// voice upload leave to the text (hooks.Deps.TextReserve): the whole
+	// budget a text answer has without speech_command.
+	stopTextReserve = hookTimeout
 	// waitTimeout outlives the waiting hook's 12-hour deadline, so tg, not
 	// this context, ends the wait and can edit the phone's message.
 	waitTimeout = 12*time.Hour + 2*time.Minute
@@ -40,6 +51,9 @@ const (
 // waitPermissionFn is the waiting hook; tests replace it.
 var waitPermissionFn = hooks.WaitPermission
 
+// handleFn runs every hook kind but permission-wait; tests replace it.
+var handleFn = hooks.Handle
+
 // hookClient is the hooks' Telegram client; tests point it at a fake server.
 var hookClient = telegram.New
 
@@ -50,11 +64,16 @@ func cmdHook(c *cli, args []string) int {
 	if len(args) != 1 {
 		return exitOK
 	}
+	start := time.Now()
 	kind := args[0]
 	wait := kind == "permission-wait"
 	timeout := hookTimeout
-	if wait {
+	switch kind {
+	case "permission-wait":
 		timeout = waitTimeout
+	case "stop":
+		// The config is not read yet; stopBudget narrows this once it is.
+		timeout = stopSpeechTimeout
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -89,14 +108,22 @@ func cmdHook(c *cli, args []string) int {
 		}
 		return exitOK
 	}
+	if kind == "stop" {
+		// Counted from the start, as the outer context is: reading stdin
+		// and the config come out of the budget, as they always did.
+		var cancelStop context.CancelFunc
+		ctx, cancelStop = context.WithDeadline(ctx, start.Add(stopBudget(cfg)))
+		defer cancelStop()
+	}
 	cwd, _ := os.Getwd()
 	env := session.FromEnv(c.env, cwd)
 	client := hookClient(cfg.BotToken)
+	sender := &send.Sender{API: client, Store: store, ChatID: cfg.ChatID, MinGap: minGap, Log: store.Logf, Secrets: cfg.Secrets()}
 	deps := hooks.Deps{
-		Sender: &send.Sender{API: client, Store: store, ChatID: cfg.ChatID, MinGap: minGap, Log: store.Logf, Secrets: []string{cfg.BotToken}},
+		Sender: sender,
 		Store:  store,
 		Resolve: func(ctx context.Context, env session.Env) (*state.Session, error) {
-			return session.Resolve(ctx, store, cfg.ClaudePath, env)
+			return session.Resolve(ctx, store, cfg.ClaudePath, env, session.Options{Tab: agtermTab, Clean: sender.Clean})
 		},
 		Away:   func(ctx context.Context) bool { return idle.Away(ctx, cfg.AwayAfterSeconds, idle.IdleSeconds) },
 		AwayIn: func(ctx context.Context) time.Duration { return awayIn(ctx, cfg.AwayAfterSeconds, idle.IdleSeconds) },
@@ -115,7 +142,18 @@ func cmdHook(c *cli, args []string) int {
 		},
 		Alive: processAlive,
 	}
-	if pane := ownPane(env); wait && !pane.IsZero() {
+	if cfg.SpeechCommand != "" {
+		deps.Speaker = speechOnSignal{speechRunner(c, cfg.SpeechCommand)}
+		deps.TextReserve = stopTextReserve
+		// TypeSafe only chooses which answers are spoken: without speech
+		// it is never asked.
+		if cfg.TypesafeAPIKey != "" {
+			deps.Classifier = &classify.Client{Key: cfg.TypesafeAPIKey}
+		}
+	}
+	// The waiting hook reads its pane for its dialog; the notification
+	// hook, to tell whether the dialog on it is one a waiting hook claimed.
+	if pane := ownPane(env); (wait || kind == "notification") && !pane.IsZero() {
 		terminals := term.Mux{Backends: map[string]term.Terminal{agterm.Backend: &agterm.CLI{}, tmux.Backend: &tmux.CLI{}}}
 		deps.Screen = func(ctx context.Context) (string, error) {
 			ctx, cancel := context.WithTimeout(ctx, screenTimeout)
@@ -135,10 +173,37 @@ func cmdHook(c *cli, args []string) int {
 		}
 		return exitOK
 	}
-	if err := hooks.Handle(ctx, kind, in, deps); err != nil {
+	if err := handleFn(ctx, kind, in, deps); err != nil {
 		store.Logf("hook %s (%s): %v", kind, in.SessionID, err)
 	}
 	return exitOK
+}
+
+// stopBudget is how long the stop hook may run, counted from its start:
+// stopSpeechTimeout when speech_command is set, so a short answer can be
+// spoken and still followed by its text, of which speech and its upload
+// leave the last stopTextReserve (hookTimeout) to the text; else
+// hookTimeout as before.
+func stopBudget(cfg *config.Config) time.Duration {
+	if cfg.SpeechCommand != "" {
+		return stopSpeechTimeout
+	}
+	return hookTimeout
+}
+
+// speechOnSignal runs the speech command so that a signal that would end
+// the hook (SIGTERM, SIGHUP, an interrupt) ends the speech instead. The
+// command runs in a process group of its own, which the signal does not
+// reach: cancelled, it is killed rather than orphaned past its timeout,
+// and the hook goes on to send the text. Once the speech is over the
+// signals regain their default effect.
+type speechOnSignal struct{ hooks.Speaker }
+
+// Speak implements hooks.Speaker.
+func (s speechOnSignal) Speak(ctx context.Context, text, lang string) ([]byte, error) {
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGHUP, os.Interrupt)
+	defer stop()
+	return s.Speaker.Speak(ctx, text, lang)
 }
 
 // writeFlushed writes b to w and flushes w when it buffers.
