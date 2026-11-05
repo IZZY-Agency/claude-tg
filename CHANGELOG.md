@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.1
+
+- The relay tells you when another program reads the bot's updates.
+  Telegram gives them to one reader at a time, so a second poller with the
+  same token (usually the Claude Code Telegram plugin left enabled, often on
+  another machine) silently took some of your replies and button taps.
+  After a minute of conflicting polls the relay sends one ⚙️ alert, and an
+  all-clear once the other program has stopped for two minutes. `tg relay
+  status`, `tg setup --check` and `/status` show `poll conflict` meanwhile.
+- `tg setup` and `tg setup --check` warn when the Telegram plugin is enabled
+  with tg's bot token.
+- `tg setup` no longer reports every 409 from Telegram as an active webhook.
+- A poll error that repeats is logged once, then as a count every 10
+  minutes and when it stops, instead of once per poll.
+
 ## 0.4.0
 
 - Prompts during a turn you started from the phone come to the phone at once,

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // Button is one inline-keyboard button.
@@ -132,6 +133,21 @@ func (e *APIError) Error() string {
 		return fmt.Sprintf("telegram %d: %s (retry after %ds)", e.Code, e.Description, e.RetryAfter)
 	}
 	return fmt.Sprintf("telegram %d: %s", e.Code, e.Description)
+}
+
+// PollConflict reports whether err is Telegram ending a getUpdates because
+// a newer getUpdates for the same bot took over: another program reads
+// this bot's updates. Telegram serves one reader at a time.
+func PollConflict(err error) bool {
+	var api *APIError
+	return errors.As(err, &api) && api.Code == 409 && strings.Contains(api.Description, "terminated by other getUpdates request")
+}
+
+// WebhookConflict reports whether err is Telegram refusing getUpdates
+// because a webhook is set for the bot.
+func WebhookConflict(err error) bool {
+	var api *APIError
+	return errors.As(err, &api) && api.Code == 409 && strings.Contains(api.Description, "webhook is active")
 }
 
 // NetError wraps a transport-level failure (DNS, TCP, TLS, timeout).

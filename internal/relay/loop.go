@@ -27,6 +27,7 @@ type Loop struct {
 	Log    func(string, ...any)
 
 	stopWait time.Duration // bound on the wait for the voice worker once Run stops it; 0: voiceStopWait
+	backoff  time.Duration // wait after a failed poll; 0: pollBackoff
 }
 
 const (
@@ -126,6 +127,11 @@ func (l *Loop) Run(ctx context.Context) error {
 	}
 	draining := true
 	skipped := 0
+	health := l.startHealth(rs)
+	backoff := l.backoff
+	if backoff <= 0 {
+		backoff = pollBackoff
+	}
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -139,17 +145,18 @@ func (l *Loop) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			l.logf("getUpdates: %v", err)
+			l.pollFailed(ctx, &health, &rs, err)
 			if l.Once {
 				return err
 			}
 			select {
 			case <-ctx.Done():
 				return nil
-			case <-time.After(pollBackoff):
+			case <-time.After(backoff):
 			}
 			continue
 		}
+		l.pollSucceeded(ctx, &health, &rs)
 		for _, u := range ups {
 			if ctx.Err() != nil {
 				return nil // unclaimed updates are delivered by the next run

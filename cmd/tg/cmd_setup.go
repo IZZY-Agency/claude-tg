@@ -91,6 +91,29 @@ func resolveToken(flagTok, envTok, cfgTok, channelEnvPath string) (string, strin
 	return "", ""
 }
 
+// telegramPlugin is the official Claude Code Telegram channel plugin. Its
+// server polls its bot's updates in every session while the plugin is
+// enabled, so with tg's token it takes replies and taps from the relay.
+const telegramPlugin = "telegram@claude-plugins-official"
+
+const pluginWarning = "telegram plugin: enabled with this bot's token; it reads the same updates as the relay, so replies and button taps get lost. Turn it off: claude plugin disable " + telegramPlugin
+
+// pluginShares reports whether settingsSrc enables the Telegram channel
+// plugin with token in its .env.
+func pluginShares(settingsSrc []byte, channelEnvPath, token string) bool {
+	var s struct {
+		EnabledPlugins map[string]any `json:"enabledPlugins"`
+	}
+	if token == "" || json.Unmarshal(settingsSrc, &s) != nil {
+		return false
+	}
+	if on, _ := s.EnabledPlugins[telegramPlugin].(bool); !on {
+		return false
+	}
+	tok, _ := resolveToken("", "", "", channelEnvPath)
+	return tok == token
+}
+
 func isTTY(r io.Reader) bool {
 	f, ok := r.(*os.File)
 	if !ok {
@@ -303,6 +326,9 @@ func cmdSetup(c *cli, args []string) int {
 		fmt.Fprintf(c.stderr, "tg setup: read settings: %v\n", err)
 		return exitUsage
 	}
+	if pluginShares(src, p.channelEnv, token) {
+		fmt.Fprintln(c.stderr, "warning: "+pluginWarning)
+	}
 	var oldBinaries []string
 	if existing != nil && existing.BinaryPath != "" {
 		oldBinaries = append(oldBinaries, existing.BinaryPath)
@@ -461,9 +487,12 @@ func discoverChat(c *cli, ctx context.Context, client *telegram.Client, botName 
 	for time.Now().Before(deadline) {
 		ups, err := client.GetUpdates(ctx, offset, 20)
 		if err != nil {
-			var api *telegram.APIError
-			if errors.As(err, &api) && api.Code == 409 {
+			switch {
+			case telegram.WebhookConflict(err):
 				fmt.Fprintln(c.stderr, "tg setup: Telegram says a webhook is active for this bot; remove it with deleteWebhook before running setup")
+				return 0, 0, 3
+			case telegram.PollConflict(err):
+				fmt.Fprintln(c.stderr, "tg setup: another program is reading this bot's updates (usually the Claude Code Telegram plugin, or a tg relay on another machine); turn it off and run setup again, or pass --chat-id")
 				return 0, 0, 3
 			}
 			fmt.Fprintf(c.stderr, "tg setup: getUpdates: %v\n", err)
@@ -535,6 +564,15 @@ func setupCheck(c *cli, p paths, existing *config.Config, bin string) int {
 		fmt.Fprintf(c.stdout, "relay: %s installed (%s)\n", newServiceManager(c).Kind(), path)
 	} else {
 		fmt.Fprintln(c.stdout, "relay: not installed (tg relay install)")
+	}
+	// A bare Store: reading relay.json must not create the state dir.
+	if rs, err := (&state.Store{Dir: stateDir(c)}).LoadRelay(); err == nil {
+		if line := pollConflictLine(rs); line != "" {
+			fmt.Fprintln(c.stdout, line)
+		}
+	}
+	if existing != nil && pluginShares(src, p.channelEnv, existing.BotToken) {
+		fmt.Fprintln(c.stdout, pluginWarning)
 	}
 	if existing != nil && existing.VoiceCommand != "" {
 		fmt.Fprintln(c.stdout, "voice: configured")

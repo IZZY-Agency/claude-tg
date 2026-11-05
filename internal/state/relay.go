@@ -25,6 +25,14 @@ type RelayState struct {
 	// before a feature rewrites its state without it, so the list always
 	// describes the relay that started last.
 	Features []string `json:"features,omitempty"`
+	// PollConflictSince is when another program began reading this bot's
+	// updates, set once the conflict has lasted long enough to alert,
+	// cleared once it is over. PollConflictAlerted says the alert reached
+	// the user, who is then owed the all-clear. Both outlive a restart, so
+	// the alert is not repeated and the all-clear still comes when the
+	// conflict ended while the relay was down.
+	PollConflictSince   time.Time `json:"poll_conflict_since,omitzero"`
+	PollConflictAlerted bool      `json:"poll_conflict_alerted,omitempty"`
 }
 
 func (s *Store) relayPath() string { return filepath.Join(s.Dir, "relay.json") }

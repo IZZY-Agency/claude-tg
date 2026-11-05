@@ -15,6 +15,7 @@ import (
 	"github.com/IZZY-Agency/claude-tg/internal/agterm"
 	"github.com/IZZY-Agency/claude-tg/internal/relay"
 	"github.com/IZZY-Agency/claude-tg/internal/session"
+	"github.com/IZZY-Agency/claude-tg/internal/state"
 	"github.com/IZZY-Agency/claude-tg/internal/term"
 	"github.com/IZZY-Agency/claude-tg/internal/tmux"
 )
@@ -192,5 +193,19 @@ func relayStatus(c *cli) int {
 	if !rs.LastUpdateAt.IsZero() {
 		fmt.Fprintf(c.stdout, "last update: %s (offset %d)\n", ago(rs.LastUpdateAt), rs.Offset)
 	}
+	if line := pollConflictLine(rs); line != "" {
+		fmt.Fprintln(c.stdout, line)
+	}
 	return exitOK
+}
+
+// pollConflictLine is the status line for a relay that has seen another
+// program read the bot's updates, "" when it has not.
+func pollConflictLine(rs state.RelayState) string {
+	if rs.PollConflictSince.IsZero() {
+		return ""
+	}
+	return "poll conflict: another program has been reading this bot's updates since " + ago(rs.PollConflictSince) +
+		", so replies and button taps may not reach tg; usually the Claude Code Telegram plugin (claude plugin disable " + telegramPlugin +
+		") or a second tg relay with this bot's token, on this machine or another"
 }

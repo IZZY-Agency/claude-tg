@@ -1,6 +1,10 @@
 package state
 
-import "testing"
+import (
+	"os"
+	"strings"
+	"testing"
+)
 
 // A relay serves a feature only while it runs (holds the lock) and its
 // state lists the feature; a relay from before the feature drops the list
@@ -30,5 +34,22 @@ func TestRelayServes(t *testing.T) {
 	rs, _ := s.LoadRelay()
 	if rs.PID != 8 || rs.Features != nil {
 		t.Fatalf("state=%+v", rs)
+	}
+}
+
+func TestRelayStateOmitsNoPollConflict(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveRelay(RelayState{PID: 9}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(s.relayPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "poll_conflict") {
+		t.Fatalf("relay.json records a conflict there is none of: %s", b)
 	}
 }

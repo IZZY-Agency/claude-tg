@@ -1154,7 +1154,11 @@ func (r *Router) status(ctx context.Context, m *telegram.Message) error {
 		last = rs.LastUpdateAt.Local().Format("15:04:05")
 	}
 	up := r.now().Sub(r.StartedAt).Round(time.Minute)
-	return r.reply(ctx, m, fmt.Sprintf("relay up %s · %d live sessions · last update %s", fmtDur(up), len(live), last))
+	text := fmt.Sprintf("relay up %s · %d live sessions · last update %s", fmtDur(up), len(live), last)
+	if !rs.PollConflictSince.IsZero() {
+		text += "\n⚠️ another program has been reading this bot's updates since " + clockAt(rs.PollConflictSince, r.now()) + ": some messages may not reach tg"
+	}
+	return r.reply(ctx, m, text)
 }
 
 func fmtDur(d time.Duration) string {
