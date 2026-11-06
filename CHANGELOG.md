@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0
+
+- `/new` starts a Claude Code session from the phone. It lists your recent
+  projects, and `/new name` finds one by name: any git repository up to four
+  folders below `projects_dir`, or a folder a session has used. It is off until
+  you set `projects_dir` in the config and run `tg relay install`.
+- The session takes your next messages. With agterm, a tab resting at a shell
+  in that folder takes it; otherwise a new tab opens in a `Telegram` workspace.
+  With tmux, a detached session opens on the server your sessions use. Neither
+  takes the focus at the machine.
+- Claude Code's question about trusting a new folder comes to the phone with
+  buttons, and only your tap answers it.
+- A new session starts in your own default permission mode, or the one you set
+  in `new_session_permission_mode`. tg adds no permission flag otherwise.
+- "Which session?" for a typed message now has a **✖️ Cancel** button, as voice
+  notes already had: the message is dropped and nothing is typed.
+
 ## 0.4.1
 
 - The relay tells you when another program reads the bot's updates.

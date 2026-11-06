@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -147,5 +148,66 @@ func TestPromptVisibleIgnoresQuotedText(t *testing.T) {
 	}
 	if DialogSignature(quoted) != "" {
 		t.Fatal("no dialog, no signature")
+	}
+}
+
+type startTerm struct {
+	Terminal
+	got     []string
+	pane    Pane
+	refused error
+}
+
+func (s *startTerm) Start(_ context.Context, panes []Pane, dir, name string, l Launch) (Pane, error) {
+	s.got = append(s.got, panes[0].Socket, dir, name, l.Process)
+	return s.pane, s.refused
+}
+
+// noPanes is a backend for a Start with no session to go by.
+type noPanes struct{ pane Pane }
+
+func (n *noPanes) Exists(context.Context, Pane) bool                 { return true }
+func (n *noPanes) Type(context.Context, Pane, string) error          { return nil }
+func (n *noPanes) Screen(context.Context, Pane, int) (string, error) { return "", nil }
+func (n *noPanes) Start(context.Context, []Pane, string, string, Launch) (Pane, error) {
+	return n.pane, nil
+}
+
+// A new pane opens in the terminal the owner's sessions already run in.
+func TestMuxStartFollowsTheLikePane(t *testing.T) {
+	ag, tm := &startTerm{pane: Pane{Backend: "agterm", Target: "A"}}, &startTerm{pane: Pane{Backend: "tmux", Target: "%1"}}
+	m := Mux{Backends: map[string]Terminal{"agterm": ag, "tmux": tm}}
+	got, err := m.Start(context.Background(), []Pane{{Backend: "tmux", Target: "%0", Socket: "/s"}}, "/code/shop", "shop", Launch{Process: "cmd"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Target != "%1" || len(ag.got) != 0 || !reflect.DeepEqual(tm.got, []string{"/s", "/code/shop", "shop", "cmd"}) {
+		t.Fatalf("pane %+v, agterm %v, tmux %v", got, ag.got, tm.got)
+	}
+}
+
+func TestMuxStartWithoutALikePaneTakesTheFirstInstalled(t *testing.T) {
+	old := lookPath
+	t.Cleanup(func() { lookPath = old })
+	lookPath = func(name string) (string, error) {
+		if name == "tmux" {
+			return "/usr/bin/tmux", nil
+		}
+		return "", errors.New("not found")
+	}
+	ag, tm := &startTerm{}, &noPanes{Pane{Backend: "tmux", Target: "%1"}}
+	m := Mux{Backends: map[string]Terminal{"agterm": ag, "tmux": tm}}
+	if got, err := m.Start(context.Background(), nil, "/code/shop", "shop", Launch{Process: "cmd"}); err != nil || got.Target != "%1" || len(ag.got) != 0 {
+		t.Fatalf("pane %+v, err %v, agterm %v", got, err, ag.got)
+	}
+}
+
+func TestMuxStartWithNoTerminal(t *testing.T) {
+	old := lookPath
+	t.Cleanup(func() { lookPath = old })
+	lookPath = func(string) (string, error) { return "", errors.New("not found") }
+	m := Mux{Backends: map[string]Terminal{}}
+	if _, err := m.Start(context.Background(), nil, "/code/shop", "shop", Launch{Process: "cmd"}); err == nil {
+		t.Fatal("no terminal must be an error")
 	}
 }

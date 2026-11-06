@@ -51,7 +51,8 @@ func (l *Loop) logf(format string, args ...any) {
 // whose pendingTTL counts from the same moment as the message's date
 // (ruling R19), so an expired one still gets its expired outcome; a
 // button of /sessions ("p:") the session it names, which picks it only
-// while it is live.
+// while it is live; a button of /new ("n:") its parked list, like a session
+// pick.
 func updateTime(u telegram.Update) time.Time {
 	switch {
 	case u.CallbackQuery != nil && undatedTap(u.CallbackQuery.Data):
@@ -67,7 +68,7 @@ func updateTime(u telegram.Update) time.Time {
 // undatedTap reports whether callback data is one of the relay's own
 // taps, which updateTime leaves undated.
 func undatedTap(data string) bool {
-	for _, prefix := range []string{"a:", "v:", "s:", pickData} {
+	for _, prefix := range []string{"a:", "v:", "s:", pickData, newData} {
 		if strings.HasPrefix(data, prefix) {
 			return true
 		}
@@ -200,8 +201,8 @@ func (l *Loop) Run(ctx context.Context) error {
 	}
 }
 
-// stopVoice ends the router's ctx (stop) and waits for the voice worker
-// before Run returns. With Once the queued notes first get all the time
+// stopVoice ends the router's ctx (stop) and waits for the voice worker, and
+// for the sessions /new is watching, before Run returns. With Once the queued notes first get all the time
 // they take, each bounded by the command's own timeout, unless ctx ends
 // (Ctrl-C): a first Whisper run that loads its model is not cut off
 // (ruling R23). Otherwise they are cancelled at once. After stop the wait
@@ -217,6 +218,7 @@ func (l *Loop) stopVoice(ctx context.Context, stop context.CancelFunc) {
 	done := make(chan struct{})
 	go func() {
 		l.Router.WaitVoice()
+		l.Router.WaitStarts()
 		close(done)
 	}()
 	if l.Once {

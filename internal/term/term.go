@@ -5,8 +5,10 @@ package term
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 )
 
@@ -15,6 +17,7 @@ const (
 	Enter     = "\n"
 	Escape    = "\x1b"
 	Backspace = "\x7f"
+	Down      = "\x1b[B"
 )
 
 // Pane names the terminal pane a session runs in.
@@ -41,6 +44,29 @@ type Terminal interface {
 	Type(ctx context.Context, p Pane, text string) error
 	Screen(ctx context.Context, p Pane, lines int) (string, error)
 }
+
+// Launch is a program to start, in the two forms a pane can need: Line for a
+// shell already running there, Process for a new pane, which has none.
+type Launch struct {
+	Line    string
+	Process string
+}
+
+// Starter is a backend that can start a program in dir, in the background:
+// in a pane resting at a shell in dir if it has one and can tell, else in a
+// new pane, under name where the backend shows one. panes are the panes of
+// the sessions tg knows of, in this backend: a new pane joins the server of
+// the first, and none of them is used, whatever it looks like.
+type Starter interface {
+	Start(ctx context.Context, panes []Pane, dir, name string, l Launch) (Pane, error)
+}
+
+// ErrNotRealized is Screen's error for a pane that has no terminal yet:
+// agterm creates none while the display sleeps.
+var ErrNotRealized = errors.New("the pane has no terminal yet")
+
+// lookPath finds a backend's tool; tests replace it.
+var lookPath = exec.LookPath
 
 // NoBackendError is returned when a pane names a backend the Mux lacks.
 type NoBackendError struct{ Backend string }
@@ -90,6 +116,23 @@ func (m Mux) Screen(ctx context.Context, p Pane, lines int) (string, error) {
 		return "", err
 	}
 	return t.Screen(ctx, p, lines)
+}
+
+// Start starts l in the backend of the first of panes, else in the first
+// installed one that can.
+func (m Mux) Start(ctx context.Context, panes []Pane, dir, name string, l Launch) (Pane, error) {
+	var names []string
+	if len(panes) > 0 {
+		names = []string{panes[0].Backend}
+	} else {
+		names = Detect(lookPath)
+	}
+	for _, n := range names {
+		if s, ok := m.Backends[n].(Starter); ok {
+			return s.Start(ctx, panes, dir, name, l)
+		}
+	}
+	return Pane{}, errors.New("no terminal to open a session in: neither agtermctl nor tmux was found")
 }
 
 // Tools maps a backend name to the executable it needs on PATH.

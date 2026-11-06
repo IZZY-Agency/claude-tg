@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -36,6 +37,14 @@ type Config struct {
 	// a typed phone answer is worth speaking; see the classify package.
 	// Empty means typed answers are never spoken.
 	TypesafeAPIKey string `json:"typesafe_api_key,omitempty"`
+	// ProjectsDir is the folder holding the owner's projects, which turns on
+	// /new: starting a session from the phone. Unset, the phone cannot start
+	// a program on this machine. Use ProjectsRoot to read it.
+	ProjectsDir string `json:"projects_dir,omitempty"`
+	// NewSessionPermissionMode is the --permission-mode those sessions start
+	// in. Unset, tg passes no flag: they start in the owner's own default
+	// mode, which is auto unless the owner chose another.
+	NewSessionPermissionMode string `json:"new_session_permission_mode,omitempty"`
 }
 
 // Secrets are the configured values that no message, button or log line
@@ -49,6 +58,20 @@ func (c *Config) Secrets() []string {
 		}
 	}
 	return out
+}
+
+// ProjectsRoot is ProjectsDir as an absolute path, "~/" resolved, or "" when
+// it is unset or not absolute: a relative one would depend on where the
+// relay started.
+func (c *Config) ProjectsRoot() string {
+	dir := strings.TrimSpace(c.ProjectsDir)
+	if dir == "~" || strings.HasPrefix(dir, "~/") {
+		dir = homeDir() + dir[1:]
+	}
+	if !filepath.IsAbs(dir) {
+		return ""
+	}
+	return filepath.Clean(dir)
 }
 
 func homeDir() string {

@@ -118,6 +118,16 @@ func (s *Session) Pane() term.Pane {
 	return term.Pane{}
 }
 
+// SetPane records the pane the session runs in; Pane reads it back.
+func (s *Session) SetPane(p term.Pane) {
+	switch p.Backend {
+	case "tmux":
+		s.TmuxPane, s.TmuxSocket = p.Target, p.Socket
+	case "agterm":
+		s.AgtermSessionID = p.Target
+	}
+}
+
 func safeName(id string) string {
 	return strings.Map(func(r rune) rune {
 		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {

@@ -210,7 +210,7 @@ func TestPickOfEndedSessionDropped(t *testing.T) {
 		t.Fatalf("typed for an ended pick: %+v", f.term.Typed)
 	}
 	last := f.lastSent(t)
-	if last.Text != "📌 <b>acme-shop-92</b> has ended\nWhich session?" || len(last.InlineKeyboard) != 2 {
+	if last.Text != "📌 <b>acme-shop-92</b> has ended\nWhich session?" || len(last.InlineKeyboard) != 3 { // two sessions and ✖️ Cancel
 		t.Fatalf("last = %+v, want the keyboard with the note", last)
 	}
 	if p := f.storedPick(t); p != (state.Pick{}) {

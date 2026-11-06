@@ -612,6 +612,86 @@ func TestTextKeyboardBusyOutcome(t *testing.T) {
 	f.toastsAre(t, "sent to acme-shop-fa")
 }
 
+// whichCancelButton returns ✖️ Cancel from the session keyboard of a typed
+// text: the row of its own at the end.
+func whichCancelButton(t *testing.T, s telegram.SendRequest) telegram.Button {
+	t.Helper()
+	kb := s.InlineKeyboard
+	if len(kb) == 0 || len(kb[len(kb)-1]) != 1 || kb[len(kb)-1][0].Text != "✖️ Cancel" {
+		t.Fatalf("no ✖️ Cancel row at the end of %+v", kb)
+	}
+	return kb[len(kb)-1][0]
+}
+
+// ✖️ Cancel on the typed-text keyboard drops the text: nothing is typed,
+// the buttons go and nothing stays parked. The owner's message is right
+// above, so the outcome does not repeat it: repeating a full-length message
+// would not fit one Telegram message, and the buttons would stay.
+func TestTextKeyboardCancel(t *testing.T) {
+	f := newFixture(t)
+	_, _ = f.store.UpdateSession(sidBlog, func(s *state.Session) { s.Follow = false })
+	f.handle(t, f.msg("please rerun", 0))
+	cancel := whichCancelButton(t, f.lastSent(t))
+	f.handle(t, tapUpdate(cancel.Data, 1001))
+	if len(f.term.Typed) != 0 {
+		t.Fatalf("typed a cancelled text: %+v", f.term.Typed)
+	}
+	sameEdit(t, f.editAt(t, 0), relaytest.Edit{MessageID: 1001, Text: "✖️ not sent"})
+	f.toastsAre(t, "cancelled")
+	if len(f.api.Reactions) != 0 {
+		t.Fatalf("reactions = %+v", f.api.Reactions)
+	}
+	if f.parked(t) != 0 {
+		t.Fatal("a cancelled text stayed parked")
+	}
+}
+
+// A session button tapped after Cancel, on a client that still shows the
+// keyboard, finds nothing to send and leaves Cancel's outcome alone.
+func TestTextKeyboardCancelThenSessionTap(t *testing.T) {
+	f := newFixture(t)
+	_, _ = f.store.UpdateSession(sidBlog, func(s *state.Session) { s.Follow = false })
+	f.handle(t, f.msg("please rerun", 0))
+	s := f.lastSent(t)
+	session := s.InlineKeyboard[0][0].Data
+	f.handle(t, tapUpdate(whichCancelButton(t, s).Data, 1001))
+	f.handle(t, tapUpdate(session, 1001))
+	if len(f.term.Typed) != 0 {
+		t.Fatalf("typed a cancelled text: %+v", f.term.Typed)
+	}
+	if len(f.api.Edits) != 1 {
+		t.Fatalf("edits = %+v", f.api.Edits)
+	}
+	f.toastsAre(t, "cancelled", expiredToast)
+}
+
+// Cancel on a text that has expired says so, as a session button does.
+func TestTextKeyboardCancelExpired(t *testing.T) {
+	f := newFixture(t)
+	_, _ = f.store.UpdateSession(sidBlog, func(s *state.Session) { s.Follow = false })
+	f.handle(t, f.msg("please rerun", 0))
+	cancel := whichCancelButton(t, f.lastSent(t))
+	f.now = f.now.Add(pendingTTL + time.Minute)
+	f.handle(t, tapUpdate(cancel.Data, 1001))
+	sameEdit(t, f.editAt(t, 0), relaytest.Edit{MessageID: 1001, Text: "expired; send the text again"})
+	f.toastsAre(t, "expired, send the text again")
+}
+
+// With no session to offer there is nothing to cancel: the owner gets the
+// reason, not a keyboard of ✖️ Cancel alone, and nothing is parked.
+func TestTextKeyboardNoSessionNoCancel(t *testing.T) {
+	f := newFixture(t)
+	f.r.Agents = relaytest.AgentsOf()
+	f.handle(t, f.msg("please rerun", 0))
+	last := f.lastSent(t)
+	if len(last.InlineKeyboard) != 0 {
+		t.Fatalf("keyboard without sessions: %+v", last)
+	}
+	if f.parked(t) != 0 {
+		t.Fatal("parked a text nothing can take")
+	}
+}
+
 func TestHelpMentionsVoice(t *testing.T) {
 	const (
 		voiceLine  = "• Or send a <b>voice note</b>: I reply with the transcript and buttons, and type it only after you tap ✅ Send (needs <code>voice_command</code>, see the README)."

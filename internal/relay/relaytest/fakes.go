@@ -36,6 +36,7 @@ type API struct {
 	Edits     []Edit
 	ReactErr  error
 	SendErr   error
+	EditErr   error // EditMessage's error, when set (recording nothing)
 	Files     map[string][]byte
 	Paths     map[string]string
 	FileErr   error
@@ -83,6 +84,9 @@ func (a *API) EditMessageText(_ context.Context, _ int64, messageID int64, text,
 func (a *API) EditMessage(_ context.Context, _ int64, messageID int64, text, _ string, kb [][]telegram.Button) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.EditErr != nil {
+		return a.EditErr
+	}
 	a.Edits = append(a.Edits, Edit{MessageID: messageID, Text: text, Keyboard: kb})
 	return nil
 }
@@ -174,6 +178,7 @@ type Term struct {
 	mu            sync.Mutex
 	Screens       map[string]string
 	Missing       map[string]bool
+	ScreenErrs    map[string]error // Screen's error for a target, when set
 	Panes         []term.Pane
 	TypeErr       error
 	FailBackspace error // returned by Type for a pure backspace run
@@ -296,6 +301,9 @@ func (t *Term) Screen(_ context.Context, p term.Pane, lines int) (string, error)
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if err := t.ScreenErrs[id]; err != nil {
+		return "", err
+	}
 	t.ScreenCalls++
 	t.ScreenLines = append(t.ScreenLines, lines)
 	if t.NextScreen != nil {

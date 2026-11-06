@@ -1599,21 +1599,18 @@ func TestStuckEditGivesTheLockUp(t *testing.T) {
 			f := newFixture(t)
 			f.putAsk(t, permAsk(askP, sidShop, "acme-shop-92", 700))
 			var wg sync.WaitGroup
-			var took time.Duration
 			var hookErr error
 			api := &slowAPI{API: f.api, slow: 1}
 			api.during = func() {
 				wg.Add(1)
 				go func() { // the signalled hook
 					defer wg.Done()
-					start := time.Now()
 					_, hookErr = f.store.UpdateAskWithin(askP, 900*time.Millisecond, func(a *state.Ask) error {
 						if tc.close {
 							a.Closed = "mac"
 						}
 						return nil
 					})
-					took = time.Since(start)
 					if hookErr == nil && tc.close {
 						_ = f.api.EditMessage(context.Background(), me, 700, "answered at the Mac", "HTML", nil)
 					}
@@ -1622,8 +1619,10 @@ func TestStuckEditGivesTheLockUp(t *testing.T) {
 			f.r.API = api
 			f.handle(t, tapUpdate(ask.TapData(askP, 0, 'y', 0), 700))
 			wg.Wait()
-			if hookErr != nil || took > 900*time.Millisecond {
-				t.Fatalf("the hook got the lock after %s: %v", took, hookErr)
+			// The error is the bound: wall-clock time here would also count
+			// the write that follows, which a busy machine stretches.
+			if hookErr != nil {
+				t.Fatalf("the hook did not get the lock in time: %v", hookErr)
 			}
 			if got := f.toasts(); !reflect.DeepEqual(got, []string{tc.toast}) {
 				t.Fatalf("toasts = %q, want %q", got, tc.toast)

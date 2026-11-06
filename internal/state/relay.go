@@ -113,6 +113,10 @@ type Parked struct {
 	AskID     string `json:"ask_id,omitempty"`
 	AskIndex  int    `json:"ask_index,omitempty"`
 	Header    string `json:"header,omitempty"`
+	// Projects is the list a message of /new offers, in button order. A
+	// record of /new has no text; for the question about trusting a folder
+	// it has SessionID, the new session, and Header, the project as shown.
+	Projects []string `json:"projects,omitempty"`
 }
 
 func (s *Store) pendingPath(key string) string {

@@ -580,3 +580,42 @@ func compact(lines []string) string {
 func OneLine(text string) string {
 	return strings.Join(strings.Fields(text), " ")
 }
+
+// TrustDialog reports whether the screen ends in Claude Code's question about
+// trusting a folder it has not opened (open), which folder it asks about, and
+// whether the highlight is on Yes (yes). The default is No, so Enter alone
+// refuses. The options and the footer must be the last lines of the screen,
+// under the dialog's heading: keys go to the pane on this answer, and the same
+// words higher up, an old dialog or a quoted one above a live prompt, would
+// send them into that prompt. The order matters too: Down has to land on Yes.
+// A shape this does not know is left to the owner, at the machine.
+func TrustDialog(screen string) (folder string, open, yes bool) {
+	var lines []string
+	for _, l := range strings.Split(screen, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	n := len(lines)
+	if n < 4 || lines[n-1] != "Enter to confirm · Esc to cancel" {
+		return "", false, false
+	}
+	if strings.TrimPrefix(lines[n-3], "❯ ") != "No, exit" || strings.TrimPrefix(lines[n-2], "❯ ") != "Yes, I trust this folder" {
+		return "", false, false
+	}
+	for i, l := range lines[:n-3] {
+		if l != "Accessing workspace:" {
+			continue
+		}
+		// A long path wraps at the pane's width.
+		var path strings.Builder
+		for _, p := range lines[i+1 : n-3] {
+			if strings.HasPrefix(p, "Quick safety check") {
+				break
+			}
+			path.WriteString(p)
+		}
+		return path.String(), true, strings.HasPrefix(lines[n-2], "❯ ")
+	}
+	return "", false, false
+}

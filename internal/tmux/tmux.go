@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -53,7 +54,21 @@ func (c *CLI) run(ctx context.Context, p term.Pane, args ...string) ([]byte, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	return c.exec(ctx, "", p, args...)
+}
+
+// exec runs tmux in folder dir, the relay's own when empty, on p's server,
+// the default one when p has no socket. It keeps the relay's secrets out of
+// the environment: a server started here would pass them to every pane it
+// ever opens.
+func (c *CLI) exec(ctx context.Context, dir string, p term.Pane, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, c.path(), c.args(p, args...)...)
+	cmd.Dir = dir
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "TELEGRAM_BOT_TOKEN=") && !strings.HasPrefix(kv, "TYPESAFE_API_KEY=") {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -65,6 +80,31 @@ func (c *CLI) run(ctx context.Context, p term.Pane, args ...string) ([]byte, err
 		return nil, fmt.Errorf("tmux %s: %s", args[0], msg)
 	}
 	return out, nil
+}
+
+// Start opens a detached tmux session running l in dir, on the server of the
+// first of panes, else the default one. tmux is started in dir rather than told it
+// with -c: -c is a format, and #(...) in a format runs a shell command, so a
+// folder named demo#(id) would run id. tmux numbers the session itself: a
+// name could clash with one in use. One call reports the pane and its
+// socket, the way back to this server, so that no later step can fail once
+// the session runs.
+func (c *CLI) Start(ctx context.Context, panes []term.Pane, dir, _ string, l term.Launch) (term.Pane, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	var server term.Pane
+	if len(panes) > 0 {
+		server.Socket = panes[0].Socket
+	}
+	out, err := c.exec(ctx, dir, server, "new-session", "-d", "-P", "-F", "#{pane_id} #{socket_path}", l.Process)
+	if err != nil {
+		return term.Pane{}, err
+	}
+	id, socket, ok := strings.Cut(strings.TrimSpace(string(out)), " ")
+	if !ok || id == "" || socket == "" {
+		return term.Pane{}, errors.New("tmux new-session: no pane id")
+	}
+	return term.Pane{Backend: Backend, Target: id, Socket: socket}, nil
 }
 
 // Exists reports whether the pane is still known to its tmux server.
@@ -102,6 +142,9 @@ var keyNames = map[rune]string{'\n': "Enter", '\x1b': "Escape", '\x7f': "BSpace"
 // parser eats an unescaped ";" at the end of an argument. A run of the same
 // key becomes {"-N", n, Key}.
 func Commands(text string) [][]string {
+	if text == term.Down { // a sequence, not one rune like the keys above
+		return [][]string{{"Down"}}
+	}
 	var out [][]string
 	var lit strings.Builder
 	var key string

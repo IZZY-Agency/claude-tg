@@ -3,6 +3,7 @@ package term
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -889,5 +890,62 @@ func TestDialogQueued(t *testing.T) {
 	cut = cut[strings.Index(cut, "\n AccuWeather® — Current Weather Tool")+1:]
 	if DialogQueued(cut) {
 		t.Error("a dialog whose title is above the read reads as queued")
+	}
+}
+
+func TestTrustDialog(t *testing.T) {
+	read := func(name string) string {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join("testdata", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	for _, c := range []struct {
+		name      string
+		screen    string
+		open, yes bool
+	}{
+		{"the default choice is No", read("trust-dialog.txt"), true, false},
+		{"Yes highlighted", read("trust-dialog-yes.txt"), true, true},
+		{"a session at its prompt", read("idle-screen.txt"), false, false},
+		{"a permission dialog", read("permission-screen.txt"), false, false},
+		// Words in an answer are no dialog: the session is past it.
+		{"the words in a session's answer", "● It asks:\nYes, I trust this folder\n❯ \n", false, false},
+		{"the highlighted words in an answer", "● It asks:\n❯ Yes, I trust this folder\n", false, false},
+		// What a tap must not type into: the dialog still in the buffer, or
+		// quoted whole, above a live prompt.
+		{"the old dialog above a live prompt", read("trust-dialog.txt") + "\n" + read("idle-screen.txt"), false, false},
+		{"Yes highlighted above a live prompt", read("trust-dialog-yes.txt") + "\n" + read("idle-screen.txt"), false, false},
+		{"half drawn", "Accessing workspace:\n/Users/alex/code/acme-shop\n", false, false},
+		{"no footer yet", "Accessing workspace:\n❯ No, exit\nYes, I trust this folder\n", false, false},
+		// Down must move onto Yes: a dialog of another shape is left alone.
+		{"the options the other way round", "Accessing workspace:\n❯ Yes, I trust this folder\nNo, exit\nEnter to confirm · Esc to cancel\n", false, false},
+		{"no heading", "❯ No, exit\nYes, I trust this folder\nEnter to confirm · Esc to cancel\n", false, false},
+		{"nothing", "", false, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			folder, open, yes := TrustDialog(c.screen)
+			if open != c.open || yes != c.yes {
+				t.Fatalf("open=%v yes=%v, want %v %v", open, yes, c.open, c.yes)
+			}
+			if want := map[bool]string{true: "/Users/alex/code/acme-shop"}[open]; folder != want {
+				t.Fatalf("folder = %q, want %q", folder, want)
+			}
+		})
+	}
+}
+
+// The question is about one folder, so a long path that wraps must read back
+// whole.
+func TestTrustDialogWrappedFolder(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("testdata", "trust-dialog.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	screen := strings.Replace(string(b), "/Users/alex/code/acme-shop", "/Users/alex/code/acme-\n shop/storefront", 1)
+	if folder, open, _ := TrustDialog(screen); !open || folder != "/Users/alex/code/acme-shop/storefront" {
+		t.Fatalf("folder = %q, open = %v", folder, open)
 	}
 }

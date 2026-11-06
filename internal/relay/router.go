@@ -53,6 +53,15 @@ type Router struct {
 	StartedAt time.Time
 	Alive     func(pid int) bool // is a waiting hook's process alive; nil: signal 0
 	Secrets   []string           // never shown in a message, a button or a toast (the bot token, the TypeSafe key), as send.Sender.Secrets
+
+	// ProjectsDir and Start turn /new on: the folder holding the projects,
+	// and how to start Claude Code with id sessionID in dir, named name;
+	// panes are the panes of the sessions tg knows of, which it must not
+	// use (term.Starter). Wake, which may be nil, wakes a sleeping display,
+	// without which a terminal may not open.
+	ProjectsDir string
+	Start       func(ctx context.Context, panes []term.Pane, dir, name, sessionID string) (term.Pane, error)
+	Wake        func(ctx context.Context)
 	// Transcriber turns voice notes into text (the owner's voice_command);
 	// nil: voice notes are not configured and get a reply saying so.
 	Transcriber Transcriber
@@ -61,7 +70,11 @@ type Router struct {
 
 	voiceMu sync.Mutex             // guards voiceQ
 	voiceQ  chan *telegram.Message // the running voice worker's queue; nil when none runs
-	voiceWG sync.WaitGroup         // notes queued or being transcribed
+	startWG sync.WaitGroup         // the new sessions being watched (watchStart)
+
+	startMu  sync.Mutex
+	starting map[term.Pane]int // their panes, with how many watches each
+	voiceWG  sync.WaitGroup    // notes queued or being transcribed
 }
 
 // Live is a running session as the relay sees it.
@@ -85,6 +98,7 @@ const (
 // Commands is the "/" menu the relay registers.
 var Commands = []telegram.BotCommand{
 	{Command: "sessions", Description: "live sessions: pick one to talk to"},
+	{Command: "new", Description: "start a session in a project: /new or /new name"},
 	{Command: "follow", Description: "follow a session: /follow name"},
 	{Command: "unfollow", Description: "stop following: /unfollow name"},
 	{Command: "approve", Description: "fallback: approve a permission prompt (reply to it or @name)"},
@@ -393,7 +407,7 @@ var errNeedTarget = errors.New("need target")
 // refused outright: never guess for an explicit reply. A pick whose
 // session has ended is dropped, and the message gets the keyboard with a
 // note (pickEnded); a pick that cannot be read refuses the message.
-func (r *Router) target(m *telegram.Message, text string, live []Live) (*Live, string, error) {
+func (r *Router) target(ctx context.Context, m *telegram.Message, text string, live []Live) (*Live, string, error) {
 	if m.ReplyToMessage != nil {
 		sess, ok := r.Store.FindSessionByMessageID(m.ReplyToMessage.MessageID)
 		if !ok {
@@ -415,7 +429,11 @@ func (r *Router) target(m *telegram.Message, text string, live []Live) (*Live, s
 	case err != nil:
 		return nil, "", err
 	case ok:
-		if l := bySession(live, p.SessionID); l != nil {
+		_, l, err := r.pickedLive(ctx, live, p.SessionID)
+		switch {
+		case err != nil:
+			return nil, "", errors.New("cannot list sessions: " + render.EscapeHTML(err.Error()))
+		case l != nil:
 			return l, text, nil
 		}
 		return nil, text, r.endedPick(p.SessionID)
@@ -431,7 +449,7 @@ func (r *Router) text(ctx context.Context, m *telegram.Message, text string) err
 	if err != nil {
 		return r.reply(ctx, m, "cannot list sessions: "+render.EscapeHTML(err.Error()))
 	}
-	l, rest, err := r.target(m, text, live)
+	l, rest, err := r.target(ctx, m, text, live)
 	if errors.Is(err, errNeedTarget) {
 		return r.askWhich(ctx, m, text, live, r.endedNote(err))
 	}
@@ -830,14 +848,19 @@ func KeyboardFor(live []Live, key string) [][]telegram.Button {
 // session keyboard.
 const noTypeable = "no live session has a terminal pane I can type into"
 
+// whichCancel stands in for the session in the callback data of ✖️ Cancel
+// on a typed text's session keyboard, "s:-:<key>": no session ID is "-".
+const whichCancel = "-"
+
 // askWhich parks the text and asks which session it is for, with the
-// session keyboard, under note when there is one (endedNote).
+// session keyboard and ✖️ Cancel, under note when there is one (endedNote).
 func (r *Router) askWhich(ctx context.Context, m *telegram.Message, text string, live []Live, note string) error {
 	key := newKey()
 	kb := KeyboardFor(live, key)
 	if len(kb) == 0 {
 		return r.reply(ctx, m, withNote(note, noTypeable))
 	}
+	kb = append(kb, []telegram.Button{{Text: "✖️ Cancel", Data: "s:" + whichCancel + ":" + key}})
 	if err := r.Store.PutPending(key, state.Parked{Text: text, MessageID: m.MessageID, Created: r.now()}); err != nil {
 		return r.reply(ctx, m, "cannot park the message: "+render.EscapeHTML(err.Error()))
 	}
@@ -858,6 +881,9 @@ func (r *Router) handleCallback(ctx context.Context, cq *telegram.CallbackQuery)
 	}
 	if strings.HasPrefix(cq.Data, pickData) {
 		return r.pickTap(ctx, cq)
+	}
+	if strings.HasPrefix(cq.Data, newData) {
+		return r.newTap(ctx, cq)
 	}
 	answer := func(text string) { r.answerCallback(ctx, cq, text) }
 	edit := func(html string) {
@@ -889,6 +915,13 @@ func (r *Router) handleCallback(ctx context.Context, cq *telegram.CallbackQuery)
 	case !ok:
 		answer("expired, send the text again")
 		edit("expired; send the text again")
+		return nil
+	}
+	if parts[1] == whichCancel {
+		// The owner's message is right above: the outcome does not repeat
+		// it, and a full-length one would not fit.
+		edit("✖️ not sent")
+		answer("cancelled")
 		return nil
 	}
 	live, err := r.live(ctx)
@@ -925,6 +958,8 @@ func (r *Router) command(ctx context.Context, m *telegram.Message, text string) 
 	switch cmd {
 	case "sessions":
 		return r.sessions(ctx, m)
+	case "new":
+		return r.newSession(ctx, m, arg)
 	case "follow", "unfollow":
 		return r.setFollow(ctx, m, arg, cmd == "follow")
 	case "approve", "deny":
@@ -942,7 +977,8 @@ Every message here comes from one Claude Code session; its name is in bold at th
 • <b>Reply to a session's message</b> (swipe it) and your text goes to that session.
 • Or start with <code>@name</code>, for example <code>@acme run the tests again</code>. A unique start of the name is enough.
 • Or pick a session in <code>/sessions</code>: plain text and voice notes go to it until you pick another or tap ✖ Clear, or an hour after the pick or your last message to it. A reply or <code>@name</code> still goes where it points.
-• Without a pick, and with exactly one followed session, plain text goes there. Otherwise I ask which session and show buttons.
+• Without a pick, and with exactly one followed session, plain text goes there. Otherwise I ask which session and show buttons, with ✖️ Cancel to drop the message.
+• /new lists your recent projects and starts a session in the one you tap; /new name finds a project by name (needs <code>projects_dir</code>, see the README).
 • Or send a <b>voice note</b>: I reply with the transcript and buttons, and type it only after you tap ✅ Send (needs <code>voice_command</code>, see the README).
 • A short answer to a voice note comes back spoken too, before the text (needs <code>speech_command</code>, see the README).
 Your text is typed into the session as its next prompt, and that session's next answer comes back here.
@@ -982,7 +1018,10 @@ func (r *Router) sessions(ctx context.Context, m *telegram.Message) error {
 	var picked *Live
 	p, ok, pickErr := r.currentPick()
 	if ok {
-		if picked = bySession(live, p.SessionID); picked == nil {
+		live, picked, err = r.pickedLive(ctx, live, p.SessionID)
+		if err != nil {
+			r.logf("sessions: %v", err)
+		} else if picked == nil {
 			r.dropPick(p.SessionID)
 		}
 	}

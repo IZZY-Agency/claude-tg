@@ -82,6 +82,22 @@ func (r *Router) usedPick(sessionID string) {
 	}
 }
 
+// pickedLive finds the picked session in live, else in a new list, which it
+// then returns too: live may be older than the pick, since /new picks its
+// session from beside the update loop, and only a session in neither has
+// ended. A new list that fails is an error, which says nothing about the
+// session: its pick stays.
+func (r *Router) pickedLive(ctx context.Context, live []Live, sessionID string) ([]Live, *Live, error) {
+	if l := bySession(live, sessionID); l != nil {
+		return live, l, nil
+	}
+	now, err := r.live(ctx)
+	if err != nil {
+		return live, nil, err
+	}
+	return now, bySession(now, sessionID), nil
+}
+
 // pickEnded is target's error when the picked session has ended: the pick
 // is dropped, and the message gets the session keyboard with a note
 // (endedNote). It is an errNeedTarget.

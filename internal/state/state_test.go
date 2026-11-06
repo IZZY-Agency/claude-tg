@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -331,7 +332,7 @@ func TestTakePendingExpiredReturnsRecord(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(s.Dir, "pending", "k.json")); !os.IsNotExist(err) {
 		t.Fatalf("expired record still on disk (err %v)", err)
 	}
-	if p, ok := s.TakePending("k", now, 10*time.Minute); ok || p != (Parked{}) {
+	if p, ok := s.TakePending("k", now, 10*time.Minute); ok || !reflect.DeepEqual(p, Parked{}) {
 		t.Fatalf("take missing: %+v ok=%v", p, ok)
 	}
 }
@@ -350,7 +351,7 @@ func TestPendingKeepsVoiceFields(t *testing.T) {
 		t.Fatalf("take: %+v ok=%v", got, ok)
 	}
 	got.Created = now
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
 }

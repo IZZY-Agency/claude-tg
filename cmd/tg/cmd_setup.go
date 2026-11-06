@@ -20,6 +20,7 @@ import (
 	"github.com/IZZY-Agency/claude-tg/internal/classify"
 	"github.com/IZZY-Agency/claude-tg/internal/config"
 	"github.com/IZZY-Agency/claude-tg/internal/send"
+	"github.com/IZZY-Agency/claude-tg/internal/session"
 	"github.com/IZZY-Agency/claude-tg/internal/settings"
 	"github.com/IZZY-Agency/claude-tg/internal/state"
 	"github.com/IZZY-Agency/claude-tg/internal/telegram"
@@ -593,6 +594,7 @@ func setupCheck(c *cli, p paths, existing *config.Config, bin string) int {
 	} else {
 		fmt.Fprintln(c.stdout, "classifier: not configured (typed answers are never spoken)")
 	}
+	fmt.Fprintln(c.stdout, newSessionsLine(existing))
 	fmt.Fprintln(c.stdout, backendsLine("none (replies unavailable)"))
 	if entries, err := os.ReadDir(filepath.Join(stateDir(c), "spool")); err == nil {
 		n := 0
@@ -688,6 +690,25 @@ func replaceFile(path string, data []byte) error {
 
 // carryOver copies the settings a re-run of setup must not reset from the
 // previous config into the freshly built one.
+// newSessionsLine reports whether /new can start sessions.
+func newSessionsLine(cfg *config.Config) string {
+	if cfg == nil || strings.TrimSpace(cfg.ProjectsDir) == "" {
+		return "new sessions: off (see the README)"
+	}
+	root := cfg.ProjectsRoot()
+	if st, err := os.Stat(root); root == "" || err != nil || !st.IsDir() {
+		return "new sessions: projects_dir is not a folder: " + cfg.ProjectsDir
+	}
+	switch mode := cfg.NewSessionPermissionMode; {
+	case mode == "":
+		return "new sessions: projects in " + root
+	case !session.ValidMode(mode):
+		return "new sessions: new_session_permission_mode is not a mode: " + mode
+	default:
+		return "new sessions: projects in " + root + ", permission mode " + mode
+	}
+}
+
 func carryOver(cfg, existing *config.Config) {
 	if existing == nil {
 		return
@@ -698,6 +719,8 @@ func carryOver(cfg, existing *config.Config) {
 	}
 	cfg.VoiceCommand = existing.VoiceCommand
 	cfg.SpeechCommand = existing.SpeechCommand
+	cfg.ProjectsDir = existing.ProjectsDir
+	cfg.NewSessionPermissionMode = existing.NewSessionPermissionMode
 }
 
 func fileExists(p string) bool {

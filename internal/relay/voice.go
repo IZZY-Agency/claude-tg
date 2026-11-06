@@ -229,7 +229,7 @@ func (r *Router) confirmVoice(ctx context.Context, m *telegram.Message, text str
 		if live, err = r.live(ctx); err != nil {
 			return r.voiceFailed(ctx, m, "cannot list sessions: "+render.EscapeHTML(err.Error()))
 		}
-		l, rest, err := r.target(m, text, live)
+		l, rest, err := r.target(ctx, m, text, live)
 		switch {
 		case errors.Is(err, errNeedTarget):
 			note = r.endedNote(err)

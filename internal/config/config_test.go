@@ -169,3 +169,22 @@ func TestConfigSecrets(t *testing.T) {
 		}
 	}
 }
+
+func TestProjectsRoot(t *testing.T) {
+	t.Setenv("HOME", "/home/alex")
+	for in, want := range map[string]string{
+		"":             "",
+		"   ":          "",
+		"~/code":       "/home/alex/code",
+		"~":            "/home/alex",
+		"/srv/code":    "/srv/code",
+		"/srv/code/":   "/srv/code",
+		" /srv/code ":  "/srv/code",
+		"~alex/code":   "", // only the owner's own home is known
+		"relative/dir": "", // it would depend on where the relay started
+	} {
+		if got := (&Config{ProjectsDir: in}).ProjectsRoot(); got != want {
+			t.Errorf("ProjectsRoot(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

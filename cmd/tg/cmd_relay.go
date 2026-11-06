@@ -6,8 +6,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -71,6 +73,27 @@ func cmdRelay(c *cli, args []string) int {
 	}
 	if a.cfg.VoiceCommand != "" {
 		router.Transcriber = voiceRunner(c, a.cfg.VoiceCommand)
+	}
+	if root := a.cfg.ProjectsRoot(); root != "" {
+		// Sessions report real paths, which a linked root would not contain.
+		if real, err := filepath.EvalSymlinks(root); err == nil {
+			root = real
+		}
+		router.ProjectsDir = root
+		router.Start = func(ctx context.Context, panes []term.Pane, dir, name, sessionID string) (term.Pane, error) {
+			launch, err := session.Launch(session.LoginShell(ctx), a.cfg.ClaudePath, sessionID, a.cfg.NewSessionPermissionMode)
+			if err != nil {
+				return term.Pane{}, err
+			}
+			return terminals.Start(ctx, panes, dir, name, launch)
+		}
+		router.Wake = func(ctx context.Context) {
+			if err := wakeDisplay(ctx); err != nil {
+				logf("wake the display: %v", err)
+			}
+		}
+	} else if a.cfg.ProjectsDir != "" {
+		logf("projects_dir is not an absolute path, /new stays off: %s", a.cfg.ProjectsDir)
 	}
 	// A run killed before it cleaned up (a crash, kill -9, a power loss)
 	// left its folder, audio included.
@@ -208,4 +231,13 @@ func pollConflictLine(rs state.RelayState) string {
 	return "poll conflict: another program has been reading this bot's updates since " + ago(rs.PollConflictSince) +
 		", so replies and button taps may not reach tg; usually the Claude Code Telegram plugin (claude plugin disable " + telegramPlugin +
 		") or a second tg relay with this bot's token, on this machine or another"
+}
+
+// wakeDisplay turns a sleeping display on: agterm opens no terminal while
+// it sleeps. caffeinate holds it for 5 s, by then the terminal has opened.
+func wakeDisplay(ctx context.Context) error {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	return exec.CommandContext(ctx, "caffeinate", "-u", "-t", "5").Run()
 }

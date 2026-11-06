@@ -538,3 +538,58 @@ func TestSetupUncheckedLineNamesTypesafeOnce(t *testing.T) {
 		t.Fatalf("out=%s", out)
 	}
 }
+
+// tg setup rewrites the config: a projects_dir set by hand must survive it.
+func TestSetupKeepsProjectsDir(t *testing.T) {
+	cfg := &config.Config{}
+	carryOver(cfg, &config.Config{ProjectsDir: "~/code", NewSessionPermissionMode: "plan"})
+	if cfg.ProjectsDir != "~/code" || cfg.NewSessionPermissionMode != "plan" {
+		t.Fatalf("carryOver lost a setting: %+v", cfg)
+	}
+}
+
+// The check names a chosen mode, and says when it would be refused.
+func TestNewSessionsLineShowsTheMode(t *testing.T) {
+	folder := t.TempDir()
+	for mode, want := range map[string]string{
+		"":                  "new sessions: projects in " + folder,
+		"bypassPermissions": "new sessions: projects in " + folder + ", permission mode bypassPermissions",
+		"nonsense":          "new sessions: new_session_permission_mode is not a mode: nonsense",
+	} {
+		if got := newSessionsLine(&config.Config{ProjectsDir: folder, NewSessionPermissionMode: mode}); got != want {
+			t.Errorf("mode %q: line = %q, want %q", mode, got, want)
+		}
+	}
+}
+
+func TestSetupCheckReportsNewSessions(t *testing.T) {
+	folder := t.TempDir()
+	for _, tc := range []struct{ name, dir, want string }{
+		{"off", "", "new sessions: off (see the README)"},
+		{"on", folder, "new sessions: projects in " + folder},
+		{"missing folder", filepath.Join(folder, "none"), "new sessions: projects_dir is not a folder: " + filepath.Join(folder, "none")},
+		{"relative", "code", "new sessions: projects_dir is not a folder: code"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := isolate(t)
+			claudeHome(t)
+			writeConfig(t, dir)
+			path := filepath.Join(dir, "config.json")
+			cfg, err := config.Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.ProjectsDir = tc.dir
+			if err := cfg.Save(path); err != nil {
+				t.Fatal(err)
+			}
+			var out bytes.Buffer
+			if code := run([]string{"setup", "--check"}, strings.NewReader(""), &out, io.Discard); code != 0 {
+				t.Fatalf("code=%d out=%s", code, out.String())
+			}
+			if !strings.Contains(out.String(), tc.want+"\n") {
+				t.Fatalf("want %q in:\n%s", tc.want, out.String())
+			}
+		})
+	}
+}

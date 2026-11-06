@@ -197,7 +197,7 @@ func TestSessionChooserMasksButtonTexts(t *testing.T) {
 	f.label(t, sidShopF, "deploy token=abcdefgh1234", "deploy token=abcdefgh1234")
 	f.handle(t, f.msg("please rerun", 0))
 	kb := f.api.Sent[len(f.api.Sent)-1].InlineKeyboard
-	if len(kb) != 2 {
+	if len(kb) != 3 { // two sessions and ✖️ Cancel
 		t.Fatalf("keyboard = %+v", kb)
 	}
 	got := []string{kb[0][0].Text, kb[1][0].Text}

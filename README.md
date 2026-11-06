@@ -206,7 +206,7 @@ Addressing a session, in order:
    session has ended, the pick is dropped and the message gets the keyboard
    of live sessions, with a note that the session ended.
 4. With no address and no pick, the single followed session gets the text.
-5. Otherwise the bot shows a keyboard of live sessions; tap one.
+5. Otherwise the bot shows a keyboard of live sessions; tap one, or **✖️ Cancel** to drop the message.
 
 Text is typed into the session's pane in two steps: the text itself (with a
 leading space, so a leading digit can never pick a dialog option), a second
@@ -279,14 +279,83 @@ read, a plan approval, a question picker) is answered at the Mac.
 After a reply or an approval from the phone, that session's next answer comes
 back to the phone even when it is not followed (two answers when it was busy).
 
-Commands: `/sessions`, `/follow name`, `/unfollow name`, `/approve` and
-`/deny`, `/status`, `/help`. Feedback: 👀 voice note received, 👍 delivered,
+Commands: `/sessions`, `/new` (see below), `/follow name`, `/unfollow name`,
+`/approve` and `/deny`, `/status`, `/help`. Feedback: 👀 voice note received, 👍 delivered,
 👌 approved, 👎 denied (Telegram allows a fixed set of reaction emojis),
 otherwise a reply with the reason. Only your Telegram id in your chat is
 honoured; everyone else is dropped silently. Each update is acknowledged
 before it is acted on, so a crash never replays a keystroke. Messages older
 than 10 minutes (the startup backlog, or what piled up while the Mac slept)
 are skipped with one notice; button taps are never skipped.
+
+### Starting a session from the phone
+
+`/new` starts a new Claude Code session in one of your projects, so you can
+begin work while away from the machine. It is off until you name the folder
+that holds your projects in `~/.config/claude-tg/config.json`:
+
+```json
+"projects_dir": "~/code"
+```
+
+Then run `tg relay install` to reload the relay. `tg setup --check` prints
+`new sessions: projects in <folder>`, and `tg setup` keeps the setting when you
+rerun it.
+
+- `/new` lists the projects your sessions used most recently, the latest
+  first, a worktree counting as its project. Tap one, or **✖️ Cancel**.
+- `/new shop` finds a project by name: any git repository up to four folders
+  below `projects_dir`, and any folder a session has used. Case does not
+  matter, and every word has to match. A name that fits one project, or
+  exactly one folder name, starts it at once. Otherwise you tap one of the
+  matches, at most eight. Hidden folders, `node_modules` and `vendor` are
+  skipped, and links are not followed.
+
+With agterm, a tab already resting at a shell in exactly that folder takes the
+session, and stays a shell when Claude Code ends. A tab with a program running,
+an overlay or a question open, or one connected to another machine, is left
+alone, and so is a tab tg knows a session in. tg presses Ctrl-C there first, so
+a command you left half typed, or a shell waiting on `read` or a continuation
+line, is interrupted and never gets the text. As with Ctrl-C at the keyboard, a
+list you already submitted, such as `read x; cmd`, goes on to `cmd`. With no
+such tab, a new one opens in a workspace
+called `Telegram`, created when needed. With tmux, a detached session opens on
+the server your sessions use. Either way nothing takes the focus at the
+machine. Once it is up the message says `✅ <name> is ready. Next messages go
+to it.`: it becomes your pick, so plain text and voice notes go there.
+
+It runs `claude` in your login shell. tg adds no permission flag, so the session
+starts in your own default mode: auto mode, unless you chose another. Prompts
+reach the phone as usual. A button names a place in the list tg offered, never
+a path, and the folder is checked again before the session starts, so the phone
+can only start sessions in folders under `projects_dir`.
+
+To start these sessions in another mode, add it to the config:
+
+```json
+"new_session_permission_mode": "plan"
+```
+
+It takes the values of Claude Code's `--permission-mode`: `acceptEdits`, `auto`,
+`bypassPermissions`, `dontAsk`, `manual` and `plan`. Any other value is refused
+when a session starts. `tg setup --check` shows the mode.
+
+Think before you choose `bypassPermissions`. Nothing then asks before a tool
+runs, so whoever holds your phone or your Telegram account can start an agent
+with full access to that project and your machine.
+
+Claude Code asks before it works in a folder it has not opened. That question
+comes to the phone, with **✅ Yes, trust** and **✖️ Cancel**, and tg never
+answers it on its own. Yes answers the dialog in the session, so Claude Code
+remembers the folder as if you had answered at the machine. Cancel, or a tap
+after 10 minutes, answers no and Claude Code exits: a new tab closes, and your
+own tab goes back to its shell. If you already answered at the machine, the tap
+types nothing.
+
+agterm cannot open a terminal while the Mac's display sleeps, so tg wakes the
+display for 5 seconds when it needs to. A session that is not up within a
+minute gets `✗ <project> did not come up within a minute`, with what its pane
+shows: usually a dialog to answer at the machine.
 
 ### Running Claude in tmux
 
@@ -448,6 +517,7 @@ To turn it off, delete `typesafe_api_key` from the config: that is the reliable 
   - for a voice note: the transcript, shown in the confirmation and its outcome, and when the command fails, the last line it wrote to stderr (or its exit status);
   - for a spoken answer: its audio, as a voice message captioned `🔊 <session name>`. The text it is made from goes to your `speech_command`, which with the recipe above keeps it on the machine; a cloud speech engine would send it where that command sends it;
   - on `/sessions` from the phone: session names, busy or idle, follow state, and the last folder name of each session's working directory;
+  - on `/new` from the phone: the folder paths of your projects below `projects_dir`, and, for a session that does not come up, the last lines of its pane;
   - once, at setup: `tg setup complete on <hostname>`;
   - with a TypeSafe key, to `api.typesafe.ai` and not to Telegram: for an answer to a turn from the phone that passed the hard rules, the phone prompt (cut to 1000 characters) and the answer or only its opening paragraph, both cleaned as above, and once at setup a request that only checks the key. See "Choosing spoken answers".
 - Nothing is sent unless a hook event fires, Claude runs `tg send` or `tg follow`, or you run `tg` yourself. Hook alerts also wait until you have been away from the machine for `away_after_seconds`, except during a turn you started from the phone.
