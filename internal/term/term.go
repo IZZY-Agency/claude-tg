@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strings"
 )
 
 // Key sequences typed into a pane. Backends translate them as needed.
@@ -109,13 +111,75 @@ func (m Mux) Type(ctx context.Context, p Pane, text string) error {
 	return t.Type(ctx, p, text)
 }
 
-// Screen forwards to the pane's backend.
+// screenPad is how many lines Screen reads beyond those asked for: in
+// fullscreen mode blank rows fill the pane under a dialog in a short
+// conversation, down to its last row (55 to 57 on an 87-row pane), where a
+// named session draws its name rule. screenDeep is the second, deeper read
+// when the first was full and still left less than asked (a pane taller
+// than lines+screenPad rows).
+const (
+	screenPad  = 200
+	screenDeep = 2000
+)
+
+// nameRuleRe is the rule Claude Code (2.1.327, fullscreen) draws on the
+// pane's last row in a session with a name (/rename, --name): dashes, the
+// name, a dash ("──── acme-desk ─").
+var nameRuleRe = regexp.MustCompile(`^\s*─+ \S(?:.*\S)? ─+\s*$`)
+
+// Screen is the last lines of the pane's screen, read by its backend, from
+// its last line that is not blank, a session's name rule aside: a dialog or
+// picker is at the bottom of the read whether or not the session has a name
+// and however many blank rows the pane has under it.
 func (m Mux) Screen(ctx context.Context, p Pane, lines int) (string, error) {
 	t, err := m.backend(p)
 	if err != nil {
 		return "", err
 	}
-	return t.Screen(ctx, p, lines)
+	s, err := t.Screen(ctx, p, lines+screenPad)
+	if err != nil {
+		return "", err
+	}
+	out, kept := bottom(s, lines)
+	if kept < lines && rows(s) >= lines+screenPad {
+		if s, err = t.Screen(ctx, p, lines+screenDeep); err != nil {
+			return "", err
+		}
+		out, _ = bottom(s, lines)
+	}
+	return out, nil
+}
+
+// bottom is the last n lines of screen and how many there are, without its
+// trailing blank lines, a name rule (nameRuleRe) after them and the blank
+// lines above that rule. A final line break stays.
+func bottom(screen string, n int) (string, int) {
+	body, nl := strings.CutSuffix(screen, "\n")
+	all := strings.Split(body, "\n")
+	end := len(all)
+	for end > 0 && strings.TrimSpace(all[end-1]) == "" {
+		end--
+	}
+	if end > 0 && nameRuleRe.MatchString(all[end-1]) {
+		end--
+		for end > 0 && strings.TrimSpace(all[end-1]) == "" {
+			end--
+		}
+	}
+	all = all[:end]
+	if len(all) > n {
+		all = all[len(all)-n:]
+	}
+	s := strings.Join(all, "\n")
+	if nl && len(all) > 0 {
+		s += "\n"
+	}
+	return s, len(all)
+}
+
+// rows is how many lines screen holds, a final line break aside.
+func rows(screen string) int {
+	return strings.Count(strings.TrimSuffix(screen, "\n"), "\n") + 1
 }
 
 // Start starts l in the backend of the first of panes, else in the first

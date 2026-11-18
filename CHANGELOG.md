@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.1
+
+- Sessions with a name (`/rename`, `--name`) get buttons again. Claude Code
+  draws the name in a rule on the pane's last row, and tg took it for the end
+  of the screen: no question picker or permission dialog was found under it,
+  so questions came to the phone as plain alerts with their JSON, and
+  `/approve` and `/deny` could not see the dialog.
+- A dialog is found however many blank rows a tall pane has under it.
+
 ## 0.5.0
 
 - `/new` starts a Claude Code session from the phone. It lists your recent
